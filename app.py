@@ -141,9 +141,12 @@ with tab_models:
             st.warning("Upload or generate data first.")
         else:
             feat, fcols = build_features(st.session_state.raw_df)
+            ui = st.session_state.include_models or []
+            allowed = [MODEL_MAP[m] for m in ui if m in MODEL_MAP]
             errs, fold_tbl, best = backtest_models(
-                feat, fcols, folds=folds, horizon=horizon, metric=metric, seasonality=52
-            )
+                feat, fcols, folds=folds, horizon=horizon, metric=metric, seasonality=52,
+                allowed_models=allowed
+        )
             st.session_state.bt = {"errors": errs, "folds": fold_tbl, "best": best, "feat": feat, "fcols": fcols}
             st.success(f"Backtest done. Best (avg): **{best}**" if best else "Backtest done.")
             st.dataframe(fold_tbl.fillna("").round(2), use_container_width=True)

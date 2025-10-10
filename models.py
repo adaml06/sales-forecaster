@@ -152,7 +152,8 @@ def fit_lgbm(Xtr: pd.DataFrame, ytr: pd.Series):
         subsample=0.9,
         colsample_bytree=0.9,
         random_state=0,
-        verbose=-1
+        verbose=-1,
+        n_jobs=1
     )
     lgb.fit(Xtr, ytr)
     return lgb
@@ -174,7 +175,7 @@ def fit_xgb(X_train: pd.DataFrame, y_train: pd.Series):
         colsample_bytree=0.8,
         reg_lambda=1.0,
         random_state=42,
-        n_jobs=0
+        n_jobs=1
     )
     model.fit(X_train, y_train)
     return model
@@ -288,6 +289,7 @@ def backtest_models(
     horizon: int = 2,
     metric: str = "MAPE",
     seasonality: int = 52,
+    allowed_models: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, float], pd.DataFrame, str]:
     """
     Rolling-origin backtest across multiple models. Skips seasonal models
@@ -313,6 +315,9 @@ def backtest_models(
     models_to_try.append("HoltWintersSafe")
     if _HAS_PROPHET:
         models_to_try.append("Prophet")
+    if allowed_models:
+        models_to_try = [m for m in models_to_try if m in set(allowed_models)]
+        
 
     fold_rows = []
     per_model_errs: Dict[str, List[float]] = {m: [] for m in models_to_try}
