@@ -80,10 +80,37 @@ MODEL_MAP = {
     "HoltWinters": "HoltWintersSafe",
     "Prophet": "Prophet",
 }
-
+# v1.1 — simple confidence badge
+def _confidence_badge(metric_name: str, best_error: float) -> tuple[str, str]:
+    """
+    Heuristic: lower errors => higher confidence.
+    Returns (emoji_label, explanation).
+    """
+    m = (metric_name or "").upper()
+    x = float(best_error if best_error is not None else 999.0)
+    if m in ("MAPE", "SMAPE"):
+        green, yellow = (10.0, 20.0) if m == "MAPE" else (12.0, 24.0)
+    else:
+        green, yellow = (0.10, 0.20)  # fallback for MAE/RMSE (relative sense)
+    if x <= green:   return "🟢 High Confidence", f"{m} ≈ {x:.2f}"
+    if x <= yellow:  return "🟡 Medium Confidence", f"{m} ≈ {x:.2f}"
+    return "🔴 Low Confidence", f"{m} ≈ {x:.2f}"
 st.set_page_config(page_title="Sales Forecaster", layout="wide")
 st.title("🧠 Sales Forecaster (Weekly)")
-
+# v1.1 — global UI mode + glossary
+with st.sidebar:
+    st.header("⚙️ Display Mode")
+    simple_mode = st.toggle("Simple Mode", value=True, help="Hide advanced knobs until you need them.")
+    st.divider()
+    with st.expander("📖 Glossary", expanded=False):
+        st.markdown("""
+**MAPE** — Mean Absolute Percentage Error; avg % difference between actuals and predictions.  
+**SMAPE** — Symmetric MAPE; bounded version of MAPE that treats over/under errors more evenly.  
+**MAE** — Mean Absolute Error; avg absolute units off.  
+**RMSE** — Root Mean Squared Error; emphasizes larger misses.  
+**Elasticity** — How sensitive demand is to price changes.  
+**Confidence Interval** — A range that likely contains the future value.  
+        """)
 tab_data, tab_models, tab_bpr = st.tabs(
     ["Data","Models & Settings","Backtest, Pick & Results"]
 )
@@ -108,27 +135,96 @@ with tab_data:
         q = data_quality_report(st.session_state.raw_df)
         color = "🟢" if q["missing"]==0 and q["gaps"]==0 else ("🟡" if q["missing"]<3 and q["gaps"]<2 else "🔴")
         st.info(f"{color} Rows: {q['rows']} | Range: {q['start']} → {q['end']} | Zeros: {q['zeros']} | Missing: {q['missing']} | Gaps: {q['gaps']}")
+            # v1.1 — friendly warnings
+        if q["rows"] < 52:
+                st.warning("⚠️ Less than ~1 year of weekly data — expect wider forecast intervals and less stable backtests.")
+        if q["missing"] > 0:
+                st.warning("⚠️ Missing values in `sales` detected — consider filling or removing them for best results.")
+        if q["gaps"] > 0:
+                st.warning("⚠️ Irregular weekly gaps detected — the app will reindex, but results may be noisier.")
+        # v1.1 — Quick Forecast
+        st.subheader("🚀 Quick Forecast")
+        if st.button("Run Quick Forecast"):
+            if st.session_state.raw_df is None:
+                st.warning("Upload or generate data first.")
+            else:
+                quick_h = 12
+                df_hist = st.session_state.raw_df.copy()
+                df_fc = train_full_and_forecast(
+                    df_hist=df_hist,
+                    make_features_fn=build_features,
+                    feature_cols=[],            # models.py recomputes features internally
+                    model_name="LightGBM",
+                    steps=quick_h,
+                    seasonality=52,
+                )
+                st.session_state.final_fc = df_fc
+                fig = plot_history_forecast(df_hist, df_fc, title=f"Quick Forecast ({quick_h} weeks, LightGBM)")
+                st.pyplot(fig, use_container_width=True)
+
+                # confidence badge (uses prior backtest if available)
+                badge, badge_sub = "🟡 Medium Confidence", "Heuristic default"
+                if "bt" in st.session_state and "errors" in st.session_state.bt:
+                    best_model = min(st.session_state.bt["errors"], key=st.session_state.bt["errors"].get)
+                    best_err   = st.session_state.bt["errors"][best_model]
+                    badge, badge_sub = _confidence_badge(st.session_state.get("metric","SMAPE"), best_err)
+                st.markdown(f"**Confidence:** {badge}  \n_{badge_sub}_")
+                st.success("Done! Switch to **Backtest, Pick & Results** to compare models or refine.")
 
 # ---------------- Models Tab ----------------
 with tab_models:
     st.subheader("2) Configure models & backtest")
-    colm1, colm2, colm3 = st.columns(3)
-    with colm1:
-        metric = st.selectbox("Metric (lower is better)", ["SMAPE","MAPE","MAE","RMSE"], index=0)
-        horizon = st.selectbox("Forecast horizon (weeks)", [4,8,12,24], index=2)
-        folds   = st.slider("Backtest folds", 3, 10, 6)
-    with colm2:
-        use_holidays = st.checkbox("Use holidays (US)", value=True, disabled=True)
-        include_models = st.multiselect(
-            "Models to consider",
-            ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"],
-            default=["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"]
-        )
-    with colm3:
-        st.markdown("**Scenario sliders (apply at forecast time):**")
-        price_adj = st.slider("Price multiplier", 0.8, 1.2, 1.0, 0.01)
-        promo_future = st.slider("Promo probability (future)", 0.0, 0.6, 0.0, 0.05)
 
+    if simple_mode:
+    # v1.1 — Simple Mode: minimal knobs
+        metric  = st.selectbox("Metric (lower is better)", ["SMAPE","MAPE","MAE","RMSE"], index=0,
+                               help="Pick how we score models.")
+        horizon = st.selectbox("Forecast horizon (weeks)", [4,8,12,24], index=2)
+        folds   = 6  # sensible default; hidden in simple mode
+        include_models = ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"]
+        colm3 = st.container()
+    else:
+    # v1.1 — Advanced Mode: full control
+        with st.expander("🔧 Advanced Settings", expanded=True):
+            colm1, colm2 = st.columns(2)
+            with colm1:
+                metric  = st.selectbox("Metric (lower is better)", ["SMAPE","MAPE","MAE","RMSE"], index=0,
+                                       help="Lower is better; SMAPE is robust for scale changes.")
+                horizon = st.selectbox("Forecast horizon (weeks)", [4,8,12,24], index=2,
+                                       help="How far ahead to predict.")
+                folds   = st.slider("Backtest folds", 3, 10, 6, help="More folds = slower but stabler.")
+            with colm2:
+                use_holidays = st.checkbox("Use holidays (US)", value=True, disabled=True,
+                                       help="Holiday regressor is already baked into the features.")
+                include_models = st.multiselect(
+                     "Models to consider",
+                   ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"],
+                    default=["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"],
+                    help="Uncheck anything you don’t want in the bake-off."
+                )
+        colm3 = st.container()
+
+    with colm3:
+        # v1.1 — Scenario Presets
+        presets = {
+            "— Select preset —": None,
+            "Hold Prices Constant": {"price": 1.00, "promo": st.session_state.get("promo_future", 0.0)},
+            "Holiday Promo Boost": {"price": 0.98, "promo": 0.30},
+            "Price Increase +2%": {"price": 1.02, "promo": st.session_state.get("promo_future", 0.0)},
+        }
+        chosen_preset = st.selectbox("Scenario preset", list(presets.keys()), index=0,
+                                     help="Pick a ready-made what-if; you can still tweak sliders.")
+        if presets[chosen_preset]:
+            st.session_state.price_adj = float(presets[chosen_preset]["price"])
+            st.session_state.promo_future = float(presets[chosen_preset]["promo"])
+
+        st.markdown("**Scenario sliders (apply at forecast time):**")
+        price_adj = st.slider("Price multiplier", 0.8, 1.2, st.session_state.get("price_adj", 1.0), 0.01,
+                              help=">1.0 raises future prices; <1.0 lowers them.")
+        promo_future = st.slider("Promo probability (future)", 0.0, 0.6, st.session_state.get("promo_future", 0.0), 0.05,
+                                 help="Fraction of future weeks expected to run promo.")
+
+    # persist selections
     st.session_state.metric = metric
     st.session_state.horizon = int(horizon)
     st.session_state.folds = int(folds)
@@ -137,22 +233,22 @@ with tab_models:
     st.session_state.promo_future = float(promo_future)
 
     if st.button("Run backtest"):
-        if st.session_state.raw_df is None:
-            st.warning("Upload or generate data first.")
-        else:
-            feat, fcols = build_features(st.session_state.raw_df)
-            ui = st.session_state.include_models or []
-            allowed = [MODEL_MAP[m] for m in ui if m in MODEL_MAP]
-            errs, fold_tbl, best = backtest_models(
-                feat, fcols, folds=folds, horizon=horizon, metric=metric, seasonality=52,
-                allowed_models=allowed
-        )
-            st.session_state.bt = {"errors": errs, "folds": fold_tbl, "best": best, "feat": feat, "fcols": fcols}
-            st.success(f"Backtest done. Best (avg): **{best}**" if best else "Backtest done.")
-            st.dataframe(fold_tbl.fillna("").round(2), use_container_width=True)
-            mean_row = pd.DataFrame([{"Model": k, "Mean Error": round(v,2)} for k,v in errs.items() if not np.isnan(v)]).sort_values("Mean Error")
-            st.caption("Average backtest error per model:")
-            st.dataframe(mean_row, use_container_width=True)
+            if st.session_state.raw_df is None:
+                st.warning("Upload or generate data first.")
+            else:
+                feat, fcols = build_features(st.session_state.raw_df)
+                ui = st.session_state.include_models or []
+                allowed = [MODEL_MAP[m] for m in ui if m in MODEL_MAP]
+                errs, fold_tbl, best = backtest_models(
+                    feat, fcols, folds=folds, horizon=horizon, metric=metric, seasonality=52,
+                    allowed_models=allowed
+                )
+                st.session_state.bt = {"errors": errs, "folds": fold_tbl, "best": best, "feat": feat, "fcols": fcols}
+                st.success(f"Backtest done. Best (avg): **{best}**" if best else "Backtest done.")
+                st.dataframe(fold_tbl.fillna("").round(2), use_container_width=True)
+                mean_row = pd.DataFrame([{"Model": k, "Mean Error": round(v,2)} for k,v in errs.items() if not np.isnan(v)]).sort_values("Mean Error")
+                st.caption("Average backtest error per model:")
+                st.dataframe(mean_row, use_container_width=True)
 with tab_bpr:
     st.subheader("3) Train best / ensemble & forecast")
     if "bt" not in st.session_state:
@@ -261,6 +357,13 @@ with tab_bpr:
                 st.session_state.final_fc = final_fc
                 fig = plot_history_forecast(st.session_state.raw_df, final_fc, title=f"Chosen: {chosen_name}")
                 st.pyplot(fig, use_container_width=True)
+                # v1.1 — Confidence Badge under chart
+                if "bt" in st.session_state and "errors" in st.session_state.bt and chosen_name:
+                    errs_local = st.session_state.bt["errors"]
+                    if chosen_name in errs_local:
+                        best_err = errs_local[chosen_name]
+                        badge, badge_sub = _confidence_badge(st.session_state.get("metric","SMAPE"), best_err)
+                        st.markdown(f"**Confidence:** {badge}  \n_{badge_sub} (best by {chosen_name})_")
 
                 # Stats footer
                 st.subheader("📊 Stats")
@@ -528,6 +631,13 @@ with tab_bpr:
         if final_fc is not None:
             fig = plot_history_forecast(st.session_state.raw_df, final_fc, title=f"Chosen: {chosen_name}")
             st.pyplot(fig, use_container_width=True)
+            # v1.1 — Confidence Badge under chart
+            if "bt" in st.session_state and "errors" in st.session_state.bt and chosen_name:
+                errs_local = st.session_state.bt["errors"]
+                if chosen_name in errs_local:
+                    best_err = errs_local[chosen_name]
+                    badge, badge_sub = _confidence_badge(st.session_state.get("metric","SMAPE"), best_err)
+                    st.markdown(f"**Confidence:** {badge}  \n_{badge_sub} (best by {chosen_name})_")
             # ===== Extra Data Insights & Strategy =====
             st.subheader("📈 Data Insights")
             df_hist = st.session_state.raw_df.copy().sort_values("date")
