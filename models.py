@@ -25,6 +25,16 @@ try:
 except Exception:
     _HAS_PROPHET = False
 
+# --- v1.3: tuned params store -----------------------------------------------
+TUNED_PARAMS: dict[str, dict] = {}   # e.g. {"LightGBM": {...}, "XGBoost": {...}}
+
+def set_tuned_params(model_name: str, params: dict | None):
+    """Store tuned params to be used by fit_* functions if provided."""
+    if not params:
+        return
+    TUNED_PARAMS[model_name] = dict(params)  # shallow copy
+# ---------------------------------------------------------------------------
+
 # -----------------------
 # Metrics (lower = better)
 # -----------------------
@@ -143,8 +153,8 @@ def predict_elastic(model, X: pd.DataFrame) -> np.ndarray:
     return predict_enet(model, X)
 
 def fit_lgbm(Xtr: pd.DataFrame, ytr: pd.Series):
-    # Small, stable config for short weekly series
-    lgb = LGBMRegressor(
+    # Small, stable config for short weekly series; overridden by tuned params if present
+    base = dict(
         n_estimators=400,
         learning_rate=0.05,
         num_leaves=15,
@@ -155,6 +165,10 @@ def fit_lgbm(Xtr: pd.DataFrame, ytr: pd.Series):
         verbose=-1,
         n_jobs=1
     )
+    user = TUNED_PARAMS.get("LightGBM", {})
+    cfg = {**base, **user}
+
+    lgb = LGBMRegressor(**cfg)
     lgb.fit(Xtr, ytr)
     return lgb
 
@@ -165,7 +179,7 @@ def predict_lgbm(model, X: pd.DataFrame) -> np.ndarray:
 def fit_xgb(X_train: pd.DataFrame, y_train: pd.Series):
     if not _HAS_XGB:
         raise ImportError("xgboost is not installed. Install it with: pip install xgboost")
-    model = XGBRegressor(
+    base = dict(
         objective="reg:squarederror",
         tree_method="hist",
         n_estimators=600,
@@ -177,6 +191,10 @@ def fit_xgb(X_train: pd.DataFrame, y_train: pd.Series):
         random_state=42,
         n_jobs=1
     )
+    user = TUNED_PARAMS.get("XGBoost", {})
+    cfg = {**base, **user}
+
+    model = XGBRegressor(**cfg)
     model.fit(X_train, y_train)
     return model
 
@@ -539,6 +557,79 @@ def forecast_ols(df_hist, make_features_fn, feature_cols, steps, seasonality=52)
     return train_full_and_forecast(
         df_hist, make_features_fn, feature_cols, model_name="OLS", steps=steps, seasonality=seasonality
     )
+
+# --- v1.3: simple auto-tuners (fast, dependency-free) -----------------------
+def _metric_fn(y_true: np.ndarray, y_pred: np.ndarray, metric: str) -> float:
+    metric = (metric or "SMAPE").upper()
+    eps = 1e-8
+    if metric == "MAPE":
+        return float(np.mean(np.abs((y_true - y_pred) / np.clip(np.abs(y_true), eps, None))) * 100)
+    if metric == "MAE":
+        return float(np.mean(np.abs(y_true - y_pred)))
+    if metric == "RMSE":
+        return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    # SMAPE default
+    return float(np.mean(2.0 * np.abs(y_true - y_pred) / np.clip(np.abs(y_true) + np.abs(y_pred), eps, None)) * 100)
+
+
+def _recent_train_val_split(feat: pd.DataFrame, feature_cols: list[str], val_len: int = 12):
+    # Keep temporal order; last val_len rows are validation
+    feat = feat.dropna(subset=feature_cols + ["sales"]).copy()
+    if len(feat) <= val_len + 10:
+        val_len = max(4, len(feat)//5)
+    tr = feat.iloc[:-val_len].copy()
+    va = feat.iloc[-val_len:].copy()
+    Xtr, ytr = tr[feature_cols], tr["sales"].astype(float)
+    Xva, yva = va[feature_cols], va["sales"].astype(float)
+    return Xtr, ytr, Xva, yva
+
+
+def tune_lightgbm(feat: pd.DataFrame, feature_cols: list[str], metric: str = "SMAPE", trials: int = 12) -> dict:
+    Xtr, ytr, Xva, yva = _recent_train_val_split(feat, feature_cols)
+    # small search space; deterministic set for speed
+    grid = [
+        {"n_estimators": n, "learning_rate": lr, "num_leaves": nl, "min_data_in_leaf": mdl}
+        for n in (200, 300, 400, 550)
+        for lr in (0.05, 0.08)
+        for nl in (15, 31)
+        for mdl in (3, 8)
+    ][:max(6, min(trials, 24))]
+
+    best = {"score": float("inf"), "params": {}}
+    for g in grid:
+        m = LGBMRegressor(
+            **{**dict(subsample=0.9, colsample_bytree=0.9, random_state=0, verbose=-1, n_jobs=1), **g}
+        ).fit(Xtr, ytr)
+        pred = m.predict(Xva).astype(float)
+        s = _metric_fn(yva.to_numpy(), pred, metric)
+        if s < best["score"]:
+            best = {"score": s, "params": g}
+    return best
+
+
+def tune_xgboost(feat: pd.DataFrame, feature_cols: list[str], metric: str = "SMAPE", trials: int = 12) -> dict:
+    if not _HAS_XGB:
+        return {"score": float("inf"), "params": {}}
+    Xtr, ytr, Xva, yva = _recent_train_val_split(feat, feature_cols)
+    grid = [
+        {"n_estimators": n, "learning_rate": lr, "max_depth": md, "subsample": ss, "colsample_bytree": cs}
+        for n in (300, 450, 600)
+        for lr in (0.05, 0.08)
+        for md in (4, 5, 6)
+        for ss in (0.7, 0.85)
+        for cs in (0.7, 0.9)
+    ][:max(6, min(trials, 24))]
+
+    best = {"score": float("inf"), "params": {}}
+    for g in grid:
+        m = XGBRegressor(
+            **{**dict(objective="reg:squarederror", tree_method="hist", random_state=42, n_jobs=1), **g}
+        ).fit(Xtr, ytr)
+        pred = m.predict(Xva).astype(float)
+        s = _metric_fn(yva.to_numpy(), pred, metric)
+        if s < best["score"]:
+            best = {"score": s, "params": g}
+    return best
 
 # Some apps call ElasticNet "elastic"
 def forecast_elastic(df_hist, make_features_fn, feature_cols, steps, seasonality=52):

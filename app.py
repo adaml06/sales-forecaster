@@ -19,9 +19,12 @@ from sample_data_ml import gen_weekly_ml, gen_weekly_profile
 
 def weighted_ensemble(preds_dict: dict, error_by_model: dict):
     """
-    preds_dict: {"ModelName": DataFrame(date, forecast), ...}
-    error_by_model: {"ModelName": error_value, ...}  (lower is better)
-    Returns a single DataFrame(date, forecast) or None if it cannot compute.
+    v1.3 dynamic weighting:
+    - Base weight = 1 / error  (lower error => higher weight)
+    - Regime adjustment = 1 / (1 + lambda * volatility)
+      where volatility = std(forecast) / (abs(mean(forecast)) + 1e-9)
+    - Final weights normalized and applied row-wise across aligned horizons.
+    Returns DataFrame(date, forecast) or None.
     """
     if not preds_dict:
         return None
@@ -35,27 +38,39 @@ def weighted_ensemble(preds_dict: dict, error_by_model: dict):
     all_dates = pd.DatetimeIndex(np.sort(np.unique(np.concatenate(all_dates))))
 
     aligned = []
-    weights = []
+    dyn_weights = []
+    lam = 0.75  # volatility penalty strength
+
     for name, df in preds_dict.items():
         err = error_by_model.get(name, np.nan)
         if not np.isfinite(err) or err <= 0:
             continue
-        w = 1.0 / err
+
         tmp = df.copy()
         tmp["date"] = pd.to_datetime(tmp["date"])
         tmp = tmp.set_index("date").reindex(all_dates)
         tmp = tmp.rename(columns={"forecast": name})
-        aligned.append(tmp[name])
-        weights.append((name, w))
+        series = tmp[name].to_numpy(dtype=float)
 
-    if not aligned or not weights:
+        mu = np.nanmean(series)
+        sd = np.nanstd(series)
+        vol = (sd / (np.abs(mu) + 1e-9)) if np.isfinite(sd) else 0.0
+
+        base = 1.0 / float(err)
+        regime_adj = 1.0 / (1.0 + lam * float(vol))
+        w = base * regime_adj
+
+        aligned.append(tmp[name])
+        dyn_weights.append((name, w))
+
+    if not aligned or not dyn_weights:
         return None
 
-    F = pd.concat(aligned, axis=1)  # cols are model names
-    w_series = pd.Series({n: w for n, w in weights})
+    F = pd.concat(aligned, axis=1)  # columns = model names
+    w_series = pd.Series({n: w for n, w in dyn_weights})
     w_series = w_series / w_series.sum()
 
-    # Row-wise weighted average that ignores NaNs
+    # Row-wise weighted average ignoring NaNs
     W = pd.DataFrame(
         np.broadcast_to(w_series.reindex(F.columns).fillna(0).values, F.shape),
         index=F.index, columns=F.columns
@@ -199,6 +214,17 @@ with tab_models:
                     default=["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"],
                     help="Uncheck anything you don’t want in the bake-off."
                 )
+                st.markdown("---")
+                autotune = st.checkbox(
+                    "🧮 Auto-tune LightGBM/XGBoost (v1.3)",
+                    value=True,
+                    help="Runs a small, fast search on the recent window to lower backtest error."
+                )
+                trials = st.slider(
+                    "Auto-tune trials (fast)",
+                    6, 24, 12, 2,
+                    help="Fewer = faster. Each try trains a tiny model on a rolling validation split."
+                )
         colm3 = st.container()
 
     with colm3:
@@ -236,6 +262,23 @@ with tab_models:
                 feat, fcols = build_features(st.session_state.raw_df)
                 ui = st.session_state.include_models or []
                 allowed = [MODEL_MAP[m] for m in ui if m in MODEL_MAP]
+                # --- v1.3: optional auto-tuning before backtest ---
+                if not simple_mode and 'autotune' in locals() and autotune:
+                    from models import tune_lightgbm, tune_xgboost, set_tuned_params
+                    if len(fcols) > 0 and len(feat) > 40:
+                        if "LightGBM" in allowed:
+                            best_lgbm = tune_lightgbm(feat, fcols, metric=metric, trials=int(trials))
+                            if best_lgbm["params"]:
+                                set_tuned_params("LightGBM", best_lgbm["params"])
+                                st.info(f"LightGBM tuned ({metric}≈{best_lgbm['score']:.2f}): {best_lgbm['params']}")
+                        if "XGBoost" in allowed:
+                            try:
+                                best_xgb = tune_xgboost(feat, fcols, metric=metric, trials=int(trials))
+                                if best_xgb["params"]:
+                                    set_tuned_params("XGBoost", best_xgb["params"])
+                                    st.info(f"XGBoost tuned ({metric}≈{best_xgb['score']:.2f}): {best_xgb['params']}")
+                            except Exception as _e:
+                                st.caption(f"(XGBoost tuning skipped: {_e})")
                 errs, fold_tbl, best = backtest_models(
                     feat, fcols, folds=folds, horizon=horizon, metric=metric, seasonality=52,
                     allowed_models=allowed
@@ -334,6 +377,11 @@ with tab_bpr:
 
             # Choose final forecast (same UI as before)
             choice = st.radio("Final forecast:", ["Best by backtest", "Weighted ensemble"], horizontal=True)
+            st.caption(
+                "💡 **Best by backtest** trains the single top-performing model from validation.  \n"
+                "🤝 **Weighted ensemble** combines all models dynamically, giving higher weight to the "
+                "ones with lower error and more stable forecasts."
+            )
 
             final_fc = None
             chosen_name = None
@@ -500,6 +548,61 @@ with tab_bpr:
                     pass
 
                 final_fc = fc
+                # --- v1.3: Model Summary (error / volatility / weight) ----------------------
+                try:
+                    errs_map = (st.session_state.bt.get("errors") or {}) if "bt" in st.session_state else {}
+                    rows = []
+                    lam = 0.75
+                    wcalc = []
+                    for mname, mdf in (preds or {}).items():
+                        vals = mdf["forecast"].astype(float).to_numpy()
+                        mu = np.nanmean(vals); sd = np.nanstd(vals)
+                        vol = (sd / (np.abs(mu) + 1e-9)) if np.isfinite(sd) else 0.0
+                        err = errs_map.get({"Elastic":"ElasticNet","HoltWinters":"HoltWintersSafe"}.get(mname,mname), np.nan)
+                        rows.append({"Model": mname, "Error ("+metric+")": err, "Volatility": vol})
+                        if np.isfinite(err) and err > 0:
+                            base = 1.0 / float(err)
+                            regime_adj = 1.0 / (1.0 + lam * float(vol))
+                            wcalc.append((mname, base * regime_adj))
+                    if wcalc:
+                        total = sum(w for _, w in wcalc) or 1.0
+                        wnorm = {n: (w/total) for n, w in wcalc}
+                        for r in rows:
+                            r["Weight"] = wnorm.get(r["Model"], np.nan)
+                    summary_df = pd.DataFrame(rows).sort_values("Weight", ascending=False)
+                    st.markdown("### 📋 Model Summary (v1.3)")
+                    st.dataframe(summary_df.round(4), use_container_width=True)
+                    with st.expander("🤝 What do these weights mean?", expanded=False):
+                        st.markdown(
+                        """
+                    **Quick idea:** the ensemble is a weighted blend of all model forecasts.
+                    - **Error**: Lower past error ⇒ higher base weight.
+                    - **Volatility penalty**: If a model’s forecast swings a lot, its weight is reduced.
+                    - **Final weight** = *(1 / error)* × *[1 / (1 + λ·volatility)]*, then normalized across models.
+
+                    ### How to read the table
+                    - **Error (your metric)**: Backtest error for each model (lower is better).
+                    - **Volatility**: How wiggly the model’s forecast is (std/|mean|). Higher = more variable.
+                    - **Weight**: The share that model contributes to the final ensemble (sums to ~1 across rows).
+
+                    ### Tips
+                    - If one model has **very low error** *and* **low volatility**, it will dominate (big Weight).
+                    - If a model is good but **noisy**, it still helps—but contributes less.
+                    - If your series regime changes (new seasonality, price shocks), weights may shift next run.
+
+                    ### FAQ
+                    - **Why not use only the “best” model?**  
+                      Ensembling reduces the risk of one model overfitting a temporary pattern.
+                    - **What is λ (lambda)?**  
+                      It’s the volatility penalty strength (λ=0.75 here). Larger λ penalizes noisier models more.
+                    - **Do weights change over time?**  
+                      Yes. Re-running backtests on new data can change errors/volatility, so weights adapt.
+                            """
+                        )
+                    st.caption("Weights = inverse-error × (1 / (1 + λ·volatility)). λ=0.75; volatility = std/|mean| of each model’s forecast.")
+                except Exception as _e:
+                    st.caption(f"(Summary table skipped: {_e})")
+                # ---------------------------------------------------------------------------
                 fig = plot_history_forecast(st.session_state.raw_df, final_fc, title=f"Chosen: {chosen_name}")
                 st.pyplot(fig, use_container_width=True)
                 # v1.1 — Confidence Badge under chart
@@ -688,22 +791,17 @@ with tab_bpr:
             m_el = ElasticNet(alpha=0.0005, l1_ratio=0.1, max_iter=5000).fit(Xtr, ytr)
             preds["Elastic"] = pd.DataFrame({"date": future_feat["date"], "forecast": m_el.predict(Xf)})
 
-        # LightGBM
+        # LightGBM (uses tuned params from models.py)
         if "LightGBM" in include_models:
-            from lightgbm import LGBMRegressor
-            m_lgb = LGBMRegressor(
-                random_state=0, n_estimators=500, learning_rate=0.05, num_leaves=31, min_data_in_leaf=5
-            ).fit(Xtr, ytr)
-            preds["LightGBM"] = pd.DataFrame({"date": future_feat["date"], "forecast": m_lgb.predict(Xf)})
-
-        # XGBoost
+            from models import fit_lgbm, predict_lgbm
+            m_lgb = fit_lgbm(Xtr, ytr)
+            preds["LightGBM"] = pd.DataFrame({"date": future_feat["date"], "forecast": predict_lgbm(m_lgb, Xf)})
+        # XGBoost (uses tuned params from models.py)
         if "XGBoost" in include_models:
             try:
-                from xgboost import XGBRegressor
-                m_xgb = XGBRegressor(
-                    n_estimators=600, learning_rate=0.05, max_depth=4, subsample=0.9, colsample_bytree=0.9
-                ).fit(Xtr, ytr)
-                preds["XGBoost"] = pd.DataFrame({"date": future_feat["date"], "forecast": m_xgb.predict(Xf)})
+                from models import fit_xgb, predict_xgb
+                m_xgb = fit_xgb(Xtr, ytr)
+                preds["XGBoost"] = pd.DataFrame({"date": future_feat["date"], "forecast": predict_xgb(m_xgb, Xf)})
             except Exception as e:
                 st.info(f"XGBoost skipped: {e}")
 
@@ -750,6 +848,11 @@ with tab_bpr:
 
         # Pick best or ensemble
         choice = st.radio("Final forecast:", ["Best by backtest", "Weighted ensemble"], horizontal=True)
+        st.caption(
+            "💡 **Best by backtest** trains the single top-performing model from validation.  \n"
+            "🤝 **Weighted ensemble** combines all models dynamically, giving higher weight to the "
+            "ones with lower error and more stable forecasts."
+        )
 
         final_fc = None
         chosen_name = None
