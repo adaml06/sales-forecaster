@@ -579,6 +579,26 @@ def run_backtest(feat, feature_cols, folds=5, horizon=4, metric="MAPE", seasonal
         seasonality=seasonality,
     )
 
+# --- v1.2: LightGBM Quantile helpers ---
+def fit_lgbm_quantile(Xtr: pd.DataFrame, ytr: pd.Series, alpha: float):
+    from lightgbm import LGBMRegressor
+    q = LGBMRegressor(
+        objective="quantile",
+        alpha=float(alpha),
+        n_estimators=400,
+        learning_rate=0.05,
+        num_leaves=15,
+        min_data_in_leaf=3,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        random_state=0,
+        verbose=-1,
+        n_jobs=1
+    )
+    q.fit(Xtr, ytr)
+    return q
 
+def predict_lgbm_quantile(model, X: pd.DataFrame) -> np.ndarray:
+    return model.predict(X).astype(float)
 
 

@@ -13,12 +13,9 @@ from models import (
     train_full_and_forecast
 )
 from utils import plot_history_forecast, combine_stats_row, score_table
+from utils import stability_score_from_preds, detect_regime_shift
 from sample_data_ml import gen_weekly_ml, gen_weekly_profile
 
-from io import BytesIO
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
 
 def weighted_ensemble(preds_dict: dict, error_by_model: dict):
     """
@@ -355,6 +352,154 @@ with tab_bpr:
 
             if final_fc is not None:
                 st.session_state.final_fc = final_fc
+                # =========================
+                # v1.2 — Forecast Reliability Layer (user-friendly)
+                # =========================
+                from models import fit_lgbm_quantile, predict_lgbm_quantile
+
+                st.markdown("### 🔍 Forecast Reliability Insights")
+                st.caption(
+                    "This section helps you **trust** your forecasts by showing how consistent, "
+                    "uncertain, and stable they are across models and time."
+                )
+
+                # --- Stability Score ---
+                stab_score, _stab_df = stability_score_from_preds(preds)
+                if stab_score >= 80:
+                    stab_badge = "🟢 Stable"
+                    stab_color = "green"
+                elif stab_score >= 60:
+                    stab_badge = "🟡 Moderate"
+                    stab_color = "orange"
+                else:
+                    stab_badge = "🔴 Unstable"
+                    stab_color = "red"
+
+                with st.expander("📊 What does Stability mean?", expanded=False):
+                    st.write(
+                        "The **Forecast Stability Score** (0–100) measures how much the different "
+                        "models agree with each other. If all models give similar results, the score "
+                        "is close to 100 (🟢 Stable). Large disagreements make it lower (🟡 Moderate "
+                        "or 🔴 Unstable)."
+                    )
+
+                st.markdown(
+                    f"**Stability:** <span style='color:{stab_color}; font-weight:bold'>{stab_badge}</span> — {stab_score:.0f}/100",
+                    unsafe_allow_html=True,
+                )
+
+                # --- Confidence Intervals ---
+                st.divider()
+                st.markdown("### 🎯 Confidence Intervals")
+                st.caption(
+                    "Confidence intervals show the **range of possible outcomes** based on model "
+                    "uncertainty or historical variability."
+                )
+
+                with st.expander("ℹ️ How are these intervals calculated?"):
+                    st.write(
+                        "- **Bootstrap residuals:** Randomly resamples past forecast errors to estimate uncertainty.\n"
+                        "- **LightGBM quantiles:** Trains special LightGBM models to predict the 10th and 90th percentile forecasts.\n"
+                        "A wider shaded area means the model is less certain about future values."
+                    )
+
+                interval_method = st.radio(
+                    "Choose uncertainty method:",
+                ["Bootstrap residuals", "LightGBM quantiles"],
+                    horizontal=True,
+                    index=0,
+                    help="Bootstrap uses past error noise; LightGBM quantiles directly estimate upper/lower bounds.",
+                )
+                # If the feature-based path was unstable/empty, quantiles may not be feasible
+                if interval_method == "LightGBM quantiles" and (Xtr is None or Xtr.shape[0] == 0 or Xf is None or Xf.shape[0] == 0):
+                    st.info("Not enough feature rows for quantile intervals; using Bootstrap residuals instead.")
+                    interval_method = "Bootstrap residuals"
+
+                fc = final_fc.copy()
+
+                try:
+                    if interval_method == "LightGBM quantiles" and chosen_name in ("LightGBM", "Ensemble (1/error weights)"):
+                        q10 = fit_lgbm_quantile(Xtr, ytr, alpha=0.10)
+                        q90 = fit_lgbm_quantile(Xtr, ytr, alpha=0.90)
+                        lower = predict_lgbm_quantile(q10, Xf)
+                        upper = predict_lgbm_quantile(q90, Xf)
+                        fc["lower"] = lower; fc["upper"] = upper
+                    else:
+                        k = min(26, max(8, len(st.session_state.raw_df) // 6))
+                        hist_df = st.session_state.raw_df.copy().sort_values("date")
+                        backcast_train = hist_df.iloc[:-k].copy()
+                        backcast_test  = hist_df.iloc[-k:].copy()
+                        from lightgbm import LGBMRegressor
+
+                        # Build features for train and test
+                        feat_tr, fcols_tr = build_features(backcast_train)
+                        feat_te, fcols_te = build_features(backcast_test)
+
+                        # Use only columns present in BOTH train and test
+                        common_cols = [c for c in fcols_tr if c in feat_te.columns]
+
+                        # If nothing in common or frames empty, fall back to rolling-mean residuals
+                        if (len(feat_tr) == 0) or (len(feat_te) == 0) or (len(common_cols) == 0):
+                            s = hist_df["sales"].astype(float).values
+                            y_hat = pd.Series(s).rolling(8, min_periods=1).mean().to_numpy()
+                            resid = (s - y_hat)[-k:]
+                        else:
+                            # Drop rows with NA in the columns we’ll use
+                            tr = feat_tr.dropna(subset=common_cols + ["sales"]).copy()
+                            te = feat_te.dropna(subset=common_cols + ["sales"]).copy()
+
+                            if (len(tr) == 0) or (len(te) == 0):
+                                s = hist_df["sales"].astype(float).values
+                                y_hat = pd.Series(s).rolling(8, min_periods=1).mean().to_numpy()
+                                resid = (s - y_hat)[-k:]
+                            else:
+                                m_resid = LGBMRegressor(
+                                    random_state=0, n_estimators=300, learning_rate=0.05, num_leaves=31, min_data_in_leaf=5
+                                ).fit(tr[common_cols], tr["sales"])
+                                y_hat = m_resid.predict(te[common_cols])
+                                resid = te["sales"].to_numpy(dtype=float) - y_hat.astype(float)
+                                # Safety: if residuals end up empty (rare), fallback
+                                if resid.size == 0:
+                                    s = hist_df["sales"].astype(float).values
+                                    y_hat = pd.Series(s).rolling(8, min_periods=1).mean().to_numpy()
+                                    resid = (s - y_hat)[-k:]
+
+                        # Bootstrap simulated paths → 10/90% bands
+                        rng = np.random.default_rng(0)
+                        B, H = 500, len(fc)
+                        sim = np.empty((B, H), dtype=float)
+                        base = fc["forecast"].to_numpy(dtype=float)
+                        for b in range(B):
+                            noise = rng.choice(resid, size=H, replace=True)
+                            sim[b, :] = base + noise
+                        fc["lower"] = np.percentile(sim, 10, axis=0)
+                        fc["upper"] = np.percentile(sim, 90, axis=0)
+                except Exception as e:
+                    st.info(f"Could not compute intervals: {e}")
+
+                # --- Regime Shift Detection ---
+                st.divider()
+                st.markdown("### ⚠️ Regime-Shift Detection")
+                st.caption(
+                    "Detects sudden changes in pattern, trend, or volatility — "
+                    "useful for spotting when the model might need retraining."
+                )
+
+                with st.expander("🤔 How does this work?"):
+                    st.write(
+                        "It compares recent trends and volatility to long-term averages. "
+                        "If the data pattern changes sharply (e.g., new seasonality, shocks, or external events), "
+                        "a ⚠️ warning appears suggesting retraining."
+                    )
+
+                try:
+                    sales_hist = st.session_state.raw_df.sort_values("date")["sales"]
+                    if detect_regime_shift(sales_hist):
+                        st.warning("⚠️ Pattern shift detected — retraining recommended.")
+                except Exception:
+                    pass
+
+                final_fc = fc
                 fig = plot_history_forecast(st.session_state.raw_df, final_fc, title=f"Chosen: {chosen_name}")
                 st.pyplot(fig, use_container_width=True)
                 # v1.1 — Confidence Badge under chart
@@ -626,7 +771,145 @@ with tab_bpr:
         # keep a copy for Export tab
         if final_fc is not None:
             st.session_state.final_fc = final_fc
+            # =========================
+            # v1.2 — Forecast Reliability Layer (user-friendly)
+            # (paste the SAME block you already added in the fallback path)
+            # =========================
+            from models import fit_lgbm_quantile, predict_lgbm_quantile
 
+            st.markdown("### 🔍 Forecast Reliability Insights")
+            st.caption(
+                "This section helps you **trust** your forecasts by showing how consistent, "
+                "uncertain, and stable they are across models and time."
+            )
+
+            # --- Stability Score ---
+            stab_score, _stab_df = stability_score_from_preds(preds)
+            if stab_score >= 80:
+                stab_badge = "🟢 Stable"; stab_color = "green"
+            elif stab_score >= 60:
+                stab_badge = "🟡 Moderate"; stab_color = "orange"
+            else:
+                stab_badge = "🔴 Unstable"; stab_color = "red"
+
+            with st.expander("📊 What does Stability mean?", expanded=False):
+                st.write(
+                    "The **Forecast Stability Score** (0–100) measures how much the different "
+                    "models agree with each other. If all models give similar results, the score "
+                    "is close to 100 (🟢 Stable). Large disagreements make it lower (🟡 Moderate "
+                    "or 🔴 Unstable)."
+                )
+
+            st.markdown(
+                f"**Stability:** <span style='color:{stab_color}; font-weight:bold'>{stab_badge}</span> — {stab_score:.0f}/100",
+                unsafe_allow_html=True,
+            )
+
+            # --- Confidence Intervals ---
+            st.divider()
+            st.markdown("### 🎯 Confidence Intervals")
+            st.caption(
+                "Confidence intervals show the **range of possible outcomes** based on model "
+                "uncertainty or historical variability."
+            )
+            with st.expander("ℹ️ How are these intervals calculated?"):
+                st.write(
+                    "- **Bootstrap residuals:** Randomly resamples past forecast errors to estimate uncertainty.\n"
+                    "- **LightGBM quantiles:** Trains special LightGBM models to predict the 10th and 90th percentile forecasts.\n"
+                    "A wider shaded area means the model is less certain about future values."
+                )
+
+            interval_method = st.radio(
+                "Choose uncertainty method:",
+                ["Bootstrap residuals", "LightGBM quantiles"],
+                horizontal=True,
+                index=0,
+                help="Bootstrap uses past error noise; LightGBM quantiles directly estimate upper/lower bounds.",
+            )
+
+            fc = final_fc.copy()
+            try:
+                if interval_method == "LightGBM quantiles" and chosen_name in ("LightGBM", "Ensemble (1/error weights)"):
+                    q10 = fit_lgbm_quantile(Xtr, ytr, alpha=0.10)
+                    q90 = fit_lgbm_quantile(Xtr, ytr, alpha=0.90)
+                    lower = predict_lgbm_quantile(q10, Xf)
+                    upper = predict_lgbm_quantile(q90, Xf)
+                    fc["lower"] = lower; fc["upper"] = upper
+                else:
+                    k = min(26, max(8, len(st.session_state.raw_df) // 6))
+                    hist_df = st.session_state.raw_df.copy().sort_values("date")
+                    backcast_train = hist_df.iloc[:-k].copy()
+                    backcast_test  = hist_df.iloc[-k:].copy()
+                    from lightgbm import LGBMRegressor
+
+                    # Build features for train and test
+                    feat_tr, fcols_tr = build_features(backcast_train)
+                    feat_te, fcols_te = build_features(backcast_test)
+
+                    # Use only the columns present in BOTH train and test
+                    common_cols = [c for c in fcols_tr if c in feat_te.columns]
+
+                    # If nothing in common or frames empty, fall back to rolling-mean residuals
+                    if (len(feat_tr) == 0) or (len(feat_te) == 0) or (len(common_cols) == 0):
+                        s = hist_df["sales"].astype(float).values
+                        y_hat = pd.Series(s).rolling(8, min_periods=1).mean().to_numpy()
+                        resid = (s - y_hat)[-k:]
+                    else:
+                        # Drop rows with NA in the columns we’ll use
+                        tr = feat_tr.dropna(subset=common_cols + ["sales"]).copy()
+                        te = feat_te.dropna(subset=common_cols + ["sales"]).copy()
+
+                        if (len(tr) == 0) or (len(te) == 0):
+                            s = hist_df["sales"].astype(float).values
+                            y_hat = pd.Series(s).rolling(8, min_periods=1).mean().to_numpy()
+                            resid = (s - y_hat)[-k:]
+                        else:
+                            m_resid = LGBMRegressor(
+                                random_state=0, n_estimators=300, learning_rate=0.05, num_leaves=31, min_data_in_leaf=5
+                            ).fit(tr[common_cols], tr["sales"])
+                            y_hat = m_resid.predict(te[common_cols])
+                            resid = te["sales"].to_numpy(dtype=float) - y_hat.astype(float)
+                            # Safety: if residuals end up empty (rare), fallback
+                            if resid.size == 0:
+                                s = hist_df["sales"].astype(float).values
+                                y_hat = pd.Series(s).rolling(8, min_periods=1).mean().to_numpy()
+                                resid = (s - y_hat)[-k:]
+
+                    # Bootstrap simulated paths → 10/90% bands
+                    rng = np.random.default_rng(0)
+                    B, H = 500, len(fc)
+                    sim = np.empty((B, H), dtype=float)
+                    base = fc["forecast"].to_numpy(dtype=float)
+                    for b in range(B):
+                        noise = rng.choice(resid, size=H, replace=True)
+                        sim[b, :] = base + noise
+                    fc["lower"] = np.percentile(sim, 10, axis=0)
+                    fc["upper"] = np.percentile(sim, 90, axis=0)
+            except Exception as e:
+                st.info(f"Could not compute intervals: {e}")
+
+            # --- Regime Shift Detection ---
+            st.divider()
+            st.markdown("### ⚠️ Regime-Shift Detection")
+            st.caption(
+                "Detects sudden changes in pattern, trend, or volatility — "
+                "useful for spotting when the model might need retraining."
+            )
+            with st.expander("🤔 How does this work?"):
+                st.write(
+                    "It compares recent trends and volatility to long-term averages. "
+                    "If the data pattern changes sharply (e.g., new seasonality, shocks, or external events), "
+                    "a ⚠️ warning appears suggesting retraining."
+                )
+            try:
+                sales_hist = st.session_state.raw_df.sort_values("date")["sales"]
+                if detect_regime_shift(sales_hist):
+                    st.warning("⚠️ Pattern shift detected — retraining recommended.")
+            except Exception:
+                pass
+
+            # replace with banded version for plotting
+            final_fc = fc
         # Plot
         if final_fc is not None:
             fig = plot_history_forecast(st.session_state.raw_df, final_fc, title=f"Chosen: {chosen_name}")

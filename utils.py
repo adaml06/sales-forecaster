@@ -55,3 +55,51 @@ def plot_history_forecast(df_hist, forecast_df, title="History + Forecast"):
     plt.legend()
     plt.tight_layout()
     return fig
+
+# --- v1.2: Reliability helpers ---
+import numpy as _np
+import pandas as _pd
+
+def stability_score_from_preds(preds_dict: dict) -> tuple[float, _pd.DataFrame]:
+    """
+    preds_dict: {"ModelName": DataFrame(date, forecast), ...}
+    Returns (score_0_100, per_date_df with columns: date, mean, std, ratio)
+    Score is 100 * (1 - mean(std/mean)) across the forecast horizon, clipped [0,100].
+    """
+    if not preds_dict:
+        return 0.0, _pd.DataFrame()
+    # align by date
+    all_dates = _pd.DatetimeIndex(sorted(_np.unique(_np.concatenate([
+        _pd.to_datetime(df["date"]).to_numpy() for df in preds_dict.values()
+    ]))))
+    aligned = []
+    for name, df in preds_dict.items():
+        tmp = df.copy()
+        tmp["date"] = _pd.to_datetime(tmp["date"])
+        tmp = tmp.set_index("date").reindex(all_dates)
+        tmp = tmp.rename(columns={"forecast": name})
+        aligned.append(tmp[name])
+    F = _pd.concat(aligned, axis=1)
+    mean = F.mean(axis=1, skipna=True)
+    std  = F.std(axis=1, skipna=True)
+    ratio = (std / mean.replace(0, _np.nan)).replace([_np.inf, -_np.inf], _np.nan).fillna(0.0)
+    score = float(100.0 * (1.0 - ratio.mean()))
+    score = float(_np.clip(score, 0.0, 100.0))
+    out = _pd.DataFrame({"date": all_dates, "mean": mean.values, "std": std.values, "ratio": ratio.values})
+    return score, out
+def detect_regime_shift(y: _pd.Series, window_short: int = 12, window_long: int = 26, z: float = 3.0) -> bool:
+    """
+    Flags a shift if recent mean deviates from longer-term mean by > z * long std,
+    or if recent volatility is > z * long volatility.
+    """
+    s = _pd.Series(_np.asarray(y, float)).dropna()
+    if len(s) < max(window_long + 4, window_short + 4):
+        return False
+    mu_s, mu_l = s.rolling(window_short).mean(), s.rolling(window_long).mean()
+    sd_l = s.rolling(window_long).std()
+    recent_mu_diff = abs(mu_s.iloc[-1] - mu_l.iloc[-1])
+    recent_sd = s.rolling(window_short).std().iloc[-1]
+    long_sd = sd_l.iloc[-1]
+    cond_level = long_sd > 0 and (recent_mu_diff > z * long_sd)
+    cond_vol   = long_sd > 0 and (recent_sd > z * long_sd)
+    return bool(cond_level or cond_vol)
