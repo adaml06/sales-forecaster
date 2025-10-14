@@ -7,8 +7,8 @@ from datetime import timedelta
 def prep_timeseries(df, date_col="date", target_col="sales", freq="W"):
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col])
-    df = df.sort_values(date_col).dropna(subset=[target_col])
-    # reindex to weekly continuous index (fills internal gaps with NaN)
+    df = df.sort_values(date_col)  # <-- do NOT dropna here
+    # reindex to weekly continuous index (fills internal gaps and KEEPS future dates)
     full_idx = pd.date_range(df[date_col].min(), df[date_col].max(), freq=freq)
     df = df.set_index(date_col).reindex(full_idx).rename_axis(date_col).reset_index()
     df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
@@ -29,12 +29,18 @@ def add_lags_rolls(d, target="sales", max_lag_list=(1,2,3,4,6,8,12,26,52), roll_
     n = len(d)
     lags = [L for L in max_lag_list if n > (L + 8)] or [1,2]
     out = d.copy()
+
+    # <<< NEW: build features from a forward-filled target so FUTURE rows aren't NaN >>>
+    s = d[target].ffill()
+
     for L in lags:
-        out[f"lag_{L}"] = out[target].shift(L)
+        out[f"lag_{L}"] = s.shift(L)
+
     windows = [w for w in roll_windows if n > (w + 8)]
     for w in windows:
-        out[f"roll_mean_{w}"] = out[target].shift(1).rolling(w, min_periods=max(2, w//2)).mean()
-        out[f"roll_std_{w}"]  = out[target].shift(1).rolling(w, min_periods=max(2, w//2)).std()
+        out[f"roll_mean_{w}"] = s.shift(1).rolling(w, min_periods=max(2, w//2)).mean()
+        out[f"roll_std_{w}"]  = s.shift(1).rolling(w, min_periods=max(2, w//2)).std()
+
     return out
 
 def add_external(df, price_col="price", promo_col="is_promo"):
@@ -43,7 +49,7 @@ def add_external(df, price_col="price", promo_col="is_promo"):
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
     if "price" in d:
-        d["price_pct_change"] = d["price"].pct_change().replace([np.inf, -np.inf], np.nan)
+        d["price_pct_change"] = d["price"].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
     if "is_promo" in d:
         d["promo_rolling_4"] = d["is_promo"].rolling(4, min_periods=1).mean()
     return d
@@ -65,9 +71,18 @@ def build_features(df, date_col="date", target_col="sales"):
     d = add_external(d)
     d = add_holidays(d, country="US", date_col=date_col)
     d = add_lags_rolls(d, target=target_col)
-    # drop rows where features are NaN due to lagging
+
     feature_cols = [c for c in d.columns if c not in [date_col, target_col]]
-    d = d.dropna(subset=feature_cols).reset_index(drop=True)
+
+    # ✅ Only clean historical rows (with known sales)
+    mask_hist = d[target_col].notna()
+    d.loc[mask_hist, feature_cols] = d.loc[mask_hist, feature_cols].ffill().fillna(0)
+
+    # ✅ Keep future rows even if features are partially NaN
+    # Just ensure at least one non-NaN feature exists so we don’t lose the entire block
+    keep = mask_hist | d[feature_cols].notna().any(axis=1)
+    d = d.loc[keep].reset_index(drop=True)
+
     return d, feature_cols
 
 def data_quality_report(df, date_col="date", target_col="sales"):

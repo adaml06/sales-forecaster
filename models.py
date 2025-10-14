@@ -6,10 +6,30 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 
+# scikit-learn: models + metrics
 from sklearn.linear_model import LinearRegression, ElasticNetCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+# LightGBM regressor
 from lightgbm import LGBMRegressor
+# Holt-Winters (statsmodels)
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+# --- NumPy 2.0 compatibility shim (must run before importing prophet) ---
+# Some libs (including older Prophet stacks) reference deprecated NumPy aliases.
+# These assignments are no-ops on older NumPy and prevent AttributeError on 2.0+.
+if not hasattr(np, "float"):
+    np.float = np.float64  # type: ignore[attr-defined]
+if not hasattr(np, "int"):
+    np.int = np.int64  # type: ignore[attr-defined]
+if not hasattr(np, "bool"):
+    np.bool = np.bool_  # type: ignore[attr-defined]
+if not hasattr(np, "object"):
+    np.object = object  # type: ignore[attr-defined]
+if not hasattr(np, "complex"):
+    np.complex = np.complex128  # type: ignore[attr-defined]
+if not hasattr(np, "float_"):
+    np.float_ = np.float64  # type: ignore[attr-defined]
+# ------------------------------------------------------------------------
 
 # --- Optional XGBoost (safe import) ---
 try:
@@ -131,16 +151,24 @@ def fit_ols(Xtr: pd.DataFrame, ytr: pd.Series):
 def predict_ols(model, X: pd.DataFrame) -> np.ndarray:
     return model.predict(X).astype(float)
 
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import ElasticNetCV
+
 def fit_enet(Xtr: pd.DataFrame, ytr: pd.Series):
-    # ElasticNet with CV to avoid overfit on many features
-    enet = ElasticNetCV(
-        l1_ratio=[0.1, 0.5, 0.9],
-        cv=min(5, max(2, len(ytr)//4)),
-        n_alphas=50,
-        random_state=0
-    )
-    enet.fit(Xtr, ytr)
-    return enet
+    pipe = Pipeline(steps=[
+        ("scaler", StandardScaler(with_mean=True, with_std=True)),
+        ("enet", ElasticNetCV(
+            l1_ratio=[0.1, 0.5, 0.9],
+            cv=min(5, max(2, len(ytr)//4)),
+            n_alphas=60,
+            max_iter=5000,
+            tol=1e-4,
+            random_state=0
+        ))
+    ])
+    pipe.fit(Xtr, ytr)
+    return pipe
 
 def predict_enet(model, X: pd.DataFrame) -> np.ndarray:
     return model.predict(X).astype(float)
