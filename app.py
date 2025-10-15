@@ -325,8 +325,97 @@ with tab_data:
             df = pd.read_csv(file, parse_dates=["date"])
             st.session_state.raw_df = df
     with col2:
-        if st.button("Generate sample data"):
-            st.session_state.raw_df = gen_weekly_ml(n_weeks=260, seed=np.random.randint(0,99999))
+        if simple_mode:
+            # Keep the existing one-click generator
+            if st.button("Generate sample data"):
+                st.session_state.raw_df = gen_weekly_ml(n_weeks=260, seed=np.random.randint(0, 99999))
+        else:
+            # Advanced Mode: presets + custom controls
+            with st.expander("🔬 Advanced sample generator", expanded=True):
+                preset = st.selectbox(
+                    "Preset",
+                    [
+                        "ml_friendly",
+                        "balanced",
+                        "baseliney",
+                        "steady_growth",
+                        "holiday_spike",
+                        "promo_driven",
+                        "price_sensitive",
+                        "post_launch_decline",
+                        "volatile_market",
+                        "flatline",
+                        "spiky_outliers",
+                        "season_switch",
+                        "short_horizon",
+                        "covid_drop",
+                        "Custom",
+                    ],
+                    index=0,
+                    help="Pick a starting profile or choose Custom to set every knob."
+                )
+
+                # --- Custom knobs (only used when preset == Custom) ---
+                n_weeks = st.number_input("History length (weeks)", 52, 520, 260, 4)
+                level = st.number_input("Base level", 0.0, 10000.0, 900.0, 50.0)
+                trend_start = st.number_input("Initial weekly trend (units/week)", -5.0, 5.0, 0.8, 0.1)
+                season_amp = st.number_input("Season amplitude (~52w)", 0.0, 500.0, 60.0, 5.0)
+                price_base = st.number_input("Price base", 0.5, 1000.0, 10.0, 0.5)
+                price_vol = st.slider("Price volatility (AR wiggle)", 0.0, 0.6, 0.07, 0.01)
+                promo_rate = st.slider("Promo rate", 0.0, 0.95, 0.18, 0.01)
+                promo_lift = st.slider("Avg promo lift", 0.0, 1.0, 0.35, 0.01)
+                noise_level = st.slider("Noise level (multiplicative)", 0.0, 0.6, 0.12, 0.01)
+
+                st.markdown("---")
+                st.caption("Optional effects (applied after generation)")
+                add_outliers = st.checkbox("Add outlier weeks (±50–100%)", value=False)
+                add_season_switch = st.checkbox("Season amplitude switch after ~60%", value=False)
+                add_covid_drop = st.checkbox("COVID-like drop & recovery", value=False)
+
+                seed = st.number_input("Random seed", 0, 1_000_000, int(np.random.randint(0, 99999)), 1)
+
+                if st.button("Generate sample data (advanced)"):
+                    if preset != "Custom":
+                        df = gen_weekly_profile(profile=preset, seed=int(seed))
+                    else:
+                        # Fully custom generation
+                        df = gen_weekly_ml(
+                            n_weeks=int(n_weeks),
+                            level=float(level),
+                            trend_start=float(trend_start),
+                            season_amp=float(season_amp),
+                            price_base=float(price_base),
+                            price_vol=float(price_vol),
+                            promo_rate=float(promo_rate),
+                            promo_lift=float(promo_lift),
+                            noise_level=float(noise_level),
+                            seed=int(seed),
+                        )
+
+                        # Optional post-effects to mirror certain presets
+                        import numpy as _np
+                        _rng = _np.random.default_rng(int(seed))
+                        if add_outliers and len(df) >= 20:
+                            k = int(_rng.integers(3, 6))
+                            idx = _rng.choice(len(df), size=k, replace=False)
+                            mult = _rng.uniform(0.5, 2.0, size=k)
+                            df.loc[idx, "sales"] = (df.loc[idx, "sales"].to_numpy() * mult).round(2)
+                        if add_season_switch and len(df) >= 40:
+                            cut = int(len(df) * 0.60)
+                            t = _np.arange(len(df) - cut)
+                            bump = 1.0 + 0.25 * _np.sin(2 * _np.pi * (t % 52) / 52.0)
+                            df.loc[cut:, "sales"] = (df.loc[cut:, "sales"].to_numpy() * bump).round(2)
+                        if add_covid_drop and len(df) >= 140:
+                            a, b, c = 80, 100, 120
+                            drop = 0.50
+                            for i in range(a, min(b, len(df))):
+                                df.loc[i, "sales"] = (df.loc[i, "sales"] * drop).round(2)
+                            for i in range(b, min(c, len(df))):
+                                alpha = (i - b) / max(1, c - b)
+                                factor = drop + (1 - drop) * alpha
+                                df.loc[i, "sales"] = (df.loc[i, "sales"] * factor).round(2)
+
+                    st.session_state.raw_df = df
     if st.session_state.raw_df is not None:
         st.write("Preview:")
         st.dataframe(st.session_state.raw_df.head(12), use_container_width=True)

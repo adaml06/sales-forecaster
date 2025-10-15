@@ -96,26 +96,98 @@ def gen_weekly_ml(
 
 def gen_weekly_profile(profile: str = "ml_friendly", seed: int = 0) -> pd.DataFrame:
     """
-    Convenience wrapper with presets:
-      - 'ml_friendly': stronger driver signal & interactions => ML shines
-      - 'balanced':   moderate driver signal; HW/sNaive still competitive
-      - 'baseliney':  closer to classic seasonal toy; sNaive often strong
+    Convenience wrapper with presets. All return the same schema: date, sales, price, is_promo.
+
+    Realistic / educational presets:
+      - 'ml_friendly'   : strong drivers & interactions; good demo for ML
+      - 'balanced'      : moderate drivers; classical methods still competitive
+      - 'baseliney'     : larger seasonality; sNaive will look strong
+      - 'steady_growth' : gentle growth + mild seasonality
+      - 'holiday_spike' : big Q4 seasonal amplitude, promo-friendly
+      - 'promo_driven'  : frequent promos with large lift
+      - 'price_sensitive': higher price volatility & noise
+      - 'post_launch_decline': high level then declining trend
+      - 'volatile_market': high noise & price wiggle
+      - 'flatline'      : nearly no signal (robustness check)
+      - 'spiky_outliers': inject a few extreme weeks
+      - 'season_switch' : seasonality amplitude changes mid-series
+      - 'short_horizon' : ~1 year of history (cold-start)
+      - 'covid_drop'    : mid-window demand dip then recovery
     """
-    profile = (profile or "ml_friendly").lower()
-    if profile == "ml_friendly":
-        return gen_weekly_ml(
-            n_weeks=260, season_amp=55, price_vol=0.09,
-            promo_rate=0.22, promo_lift=0.45, noise_level=0.12, seed=seed
-        )
-    if profile == "balanced":
-        return gen_weekly_ml(
-            n_weeks=208, season_amp=70, price_vol=0.06,
-            promo_rate=0.18, promo_lift=0.33, noise_level=0.10, seed=seed
-        )
-    if profile == "baseliney":
-        return gen_weekly_ml(
-            n_weeks=156, season_amp=100, price_vol=0.04,
-            promo_rate=0.15, promo_lift=0.25, noise_level=0.08, seed=seed
-        )
+    p = (profile or "ml_friendly").lower()
+    rng = np.random.default_rng(seed)
+
+    # --- simple presets that are direct calls -------------------------------
+    if p == "ml_friendly":
+        return gen_weekly_ml(n_weeks=260, season_amp=55, price_vol=0.09,
+                             promo_rate=0.22, promo_lift=0.45, noise_level=0.12, seed=seed)
+    if p == "balanced":
+        return gen_weekly_ml(n_weeks=208, season_amp=70, price_vol=0.06,
+                             promo_rate=0.18, promo_lift=0.33, noise_level=0.10, seed=seed)
+    if p == "baseliney":
+        return gen_weekly_ml(n_weeks=156, season_amp=100, price_vol=0.04,
+                             promo_rate=0.15, promo_lift=0.25, noise_level=0.08, seed=seed)
+    if p == "steady_growth":
+        return gen_weekly_ml(n_weeks=260, trend_start=0.5, season_amp=40,
+                             promo_rate=0.15, promo_lift=0.30, noise_level=0.10, seed=seed)
+    if p == "holiday_spike":
+        return gen_weekly_ml(n_weeks=260, trend_start=0.2, season_amp=200,
+                             promo_rate=0.25, promo_lift=0.50, noise_level=0.12, seed=seed)
+    if p == "promo_driven":
+        return gen_weekly_ml(n_weeks=208, trend_start=0.0, season_amp=30,
+                             promo_rate=0.50, promo_lift=0.80, noise_level=0.10, seed=seed)
+    if p == "price_sensitive":
+        return gen_weekly_ml(n_weeks=208, season_amp=50, price_vol=0.20,
+                             promo_rate=0.18, promo_lift=0.30, noise_level=0.14, seed=seed)
+    if p == "post_launch_decline":
+        return gen_weekly_ml(n_weeks=208, level=1200.0, trend_start=-0.6, season_amp=30,
+                             promo_rate=0.12, promo_lift=0.25, noise_level=0.10, seed=seed)
+    if p == "volatile_market":
+        return gen_weekly_ml(n_weeks=260, season_amp=60, price_vol=0.25,
+                             promo_rate=0.30, promo_lift=0.40, noise_level=0.30, seed=seed)
+    if p == "flatline":
+        return gen_weekly_ml(n_weeks=156, trend_start=0.0, season_amp=0.0,
+                             promo_rate=0.0, promo_lift=0.0, noise_level=0.05, seed=seed)
+    if p == "short_horizon":
+        return gen_weekly_ml(n_weeks=52, season_amp=55, price_vol=0.08,
+                             promo_rate=0.20, promo_lift=0.40, noise_level=0.12, seed=seed)
+
+    # --- presets with light post-processing --------------------------------
+    if p == "spiky_outliers":
+        df = gen_weekly_ml(n_weeks=208, season_amp=55, price_vol=0.08,
+                           promo_rate=0.18, promo_lift=0.35, noise_level=0.12, seed=seed)
+        k = rng.integers(3, 6)
+        idx = rng.choice(len(df), size=k, replace=False)
+        mult = rng.uniform(0.5, 2.0, size=k)
+        df.loc[idx, "sales"] = (df.loc[idx, "sales"].to_numpy() * mult).round(2)
+        return df
+
+    if p == "season_switch":
+        # Start with a normal series, then boost seasonality amplitude for the last ~40%
+        df = gen_weekly_ml(n_weeks=208, season_amp=45, price_vol=0.07,
+                           promo_rate=0.18, promo_lift=0.35, noise_level=0.12, seed=seed)
+        n = len(df)
+        cut = int(n * 0.60)
+        # multiplicative bump tied to week-of-year sine; mimics stronger seasonality
+        t = np.arange(n - cut)
+        bump = 1.0 + 0.25 * np.sin(2 * np.pi * (t % 52) / 52.0)
+        df.loc[cut:, "sales"] = (df.loc[cut:, "sales"].to_numpy() * bump).round(2)
+        return df
+
+    if p == "covid_drop":
+        df = gen_weekly_ml(n_weeks=208, season_amp=55, price_vol=0.08,
+                           promo_rate=0.18, promo_lift=0.35, noise_level=0.12, seed=seed)
+        # drop between week 80 and 100, recover linearly by week 120
+        a, b, c = 80, 100, 120
+        drop = 0.50
+        for i in range(a, b):
+            df.loc[i, "sales"] = (df.loc[i, "sales"] * drop).round(2)
+        # linear recovery
+        for i in range(b, c):
+            alpha = (i - b) / max(1, c - b)
+            factor = drop + (1 - drop) * alpha
+            df.loc[i, "sales"] = (df.loc[i, "sales"] * factor).round(2)
+        return df
+
     # default
     return gen_weekly_ml(seed=seed)
