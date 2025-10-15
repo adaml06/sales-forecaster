@@ -289,6 +289,12 @@ def _confidence_badge(metric_name: str, best_error: float) -> tuple[str, str]:
     return "🔴 Low Confidence", f"{m} ≈ {x:.2f}"
 st.set_page_config(page_title="Sales Forecaster", layout="wide")
 st.title("🧠 Sales Forecaster (Weekly)")
+# ---- Session defaults (so Results/Backtest never KeyError) ----
+_DEFAULT_MODELS = ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"]
+st.session_state.setdefault("metric", "SMAPE")
+st.session_state.setdefault("horizon", 12)
+st.session_state.setdefault("folds", 4)
+st.session_state.setdefault("include_models", _DEFAULT_MODELS)
 # v1.1 — global UI mode + glossary
 with st.sidebar:
     st.header("⚙️ Display Mode")
@@ -374,6 +380,10 @@ with tab_models:
         horizon = st.selectbox("Forecast horizon (weeks)", [4,8,12,24], index=2)
         folds   = 4  # sensible default; hidden in simple mode
         include_models = ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"]
+        st.session_state.metric = metric
+        st.session_state.horizon = int(horizon)
+        st.session_state.folds = int(folds)
+        st.session_state.include_models = include_models
         colm3 = st.container()
     else:
     # v1.1 — Advanced Mode: full control
@@ -420,7 +430,7 @@ with tab_models:
                 st.warning("Upload or generate data first.")
             else:
                 feat, fcols = build_features(st.session_state.raw_df)
-                ui = st.session_state.include_models or []
+                ui = st.session_state.get("include_models", [])
                 allowed = [MODEL_MAP[m] for m in ui if m in MODEL_MAP]
                 # --- v1.3: optional auto-tuning before backtest ---
                 if not simple_mode and 'autotune' in locals() and autotune:
