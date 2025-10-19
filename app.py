@@ -700,7 +700,10 @@ with tab_bpr:
         except Exception as e:
             st.info(f"Prophet skipped: {e}")
 
-    # 8) Build error map from backtest (names normalized)
+    # 8) Persist model forecasts for other modules (ROI/Risk, etc.)
+    st.session_state["preds_dict"] = preds  # ✅ keep the per-model forecasts handy
+
+    # 9) Build error map from backtest (names normalized)
     errs = st.session_state.bt["errors"]
     name_map = {"Elastic": "ElasticNet", "HoltWinters": "HoltWintersSafe"}
     error_for_weight = {
@@ -1176,88 +1179,337 @@ with tab_bpr:
             st.pyplot(fig, use_container_width=True)
         # ---------------------------------------------------------------------------
     
-            
+        # === v1.5 — RECOMMENDATION ENGINE + AI EXECUTIVE SUMMARY ======================
+        st.subheader("💡 Recommendation Engine + AI Executive Summary")
+
+        # ---- Business inputs (used for Profit/ROI calculations) ----------------------
+        with st.expander("Business assumptions (edit to your reality)", expanded=False):
+            col_a, col_b, col_c = st.columns(3)
+            gross_margin_pct = col_a.slider("Gross margin % of revenue", 5, 95, 35, 1,
+                                            help="Used to estimate profit from revenue deltas.")
+            promo_budget_per_week = col_b.number_input(
+                "Promo budget per promo-active week ($)", min_value=0.0, value=500.0, step=50.0,
+                help="Allocated spend when a week is in promo (probabilistic)."
+            )
+            price_change_cost_per_pct = col_c.number_input(
+                "Operational cost per 1% price change ($)", min_value=0.0, value=50.0, step=10.0,
+                help="Execution cost to move price (catalog, signage, ops)."
+            )
+            st.caption("Tip: set these roughly—relative comparisons still hold.")
+
+        # Pull freshest baseline knobs from Scenario Lab or session defaults
+        _h = int(st.session_state.get("horizon", 12))
+        _price_mult_base = float(st.session_state.get("price_adj", 1.00))
+        _promo_prob_base = float(st.session_state.get("promo_future", 0.00))
+        _season_shift = float(st.session_state.get("season_shift_pct", 0.0))
+
+        # Convenience: last observed price (fallback to 10 if missing)
+        _hist = st.session_state.raw_df.copy().sort_values("date")
+        _last_price = float(_hist["price"].dropna().iloc[-1]) if "price" in _hist.columns and _hist["price"].notna().any() else 10.0
+        _last_promo = float(_hist["is_promo"].rolling(12, min_periods=1).mean().iloc[-1]) if "is_promo" in _hist.columns else 0.0
+
+        # --- small helpers ------------------------------------------------------------
+        def _forecast_sum_units(price_mult: float, promo_prob: float) -> float:
+            """
+            Fast, local scenario evaluator (LightGBM) akin to your elasticity block:
+            trains on history, forecasts horizon for a synthetic future with specified price/promo.
+            Falls back to train_full_and_forecast if split is degenerate.
+            """
+            from models import fit_lgbm, predict_lgbm, train_full_and_forecast
+            # Build synthetic future rows by reusing your Scenario helper path
+            # 1) extend future dates
+            future_dates = pd.date_range(_hist["date"].max() + pd.Timedelta(days=7), periods=_h, freq="W")
+            # 2) clone hist; set future driver values
+            df_future = pd.DataFrame({"date": future_dates})
+            if "price" in _hist.columns:
+                df_future["price"] = _last_price * price_mult
+            if "is_promo" in _hist.columns:
+                # Bernoulli probability as expectation ≈ promo_prob
+                df_future["is_promo"] = promo_prob
+            sc_hist = pd.concat([_hist, df_future], ignore_index=True)
+
+            sc_feat, sc_fcols = build_features(sc_hist)
+            # ensure core drivers stay
+            sc_fcols = list(dict.fromkeys([c for c in ["price", "is_promo", "woy_sin", "woy_cos"] if c in sc_feat.columns] + sc_fcols))
+
+            fut = sc_feat[sc_feat["date"].isin(future_dates)]
+            tr  = sc_feat[~sc_feat["date"].isin(future_dates)]
+            if fut.empty or tr.empty or len(tr) < 30 or len(sc_fcols) == 0:
+                df_fc = train_full_and_forecast(
+                    df_hist=sc_hist,
+                    make_features_fn=build_features,
+                    feature_cols=sc_fcols,
+                    model_name="LightGBM",
+                    steps=_h, seasonality=52,
+                )
+                return float(np.nansum(df_fc["forecast"]))
+            else:
+                Xtr, ytr = tr[sc_fcols], tr["sales"].astype(float)
+                Xf       = fut[sc_fcols]
+                m = fit_lgbm(Xtr, ytr)
+                yhat = predict_lgbm(m, Xf)
+                return float(np.nansum(yhat))
+
+        def _revenue_profit(price_mult: float, promo_prob: float) -> tuple[float, float]:
+            units = _forecast_sum_units(price_mult, promo_prob)
+            # Expected future price level ≈ last observed price × multiplier
+            revenue = units * (_last_price * price_mult)
+            # Expected number of promo-active weeks ≈ promo_prob * horizon
+            promo_cost = promo_budget_per_week * (promo_prob * _h)
+            # Price change execution cost (absolute pct change)
+            exec_cost = price_change_cost_per_pct * abs((price_mult - 1.0) * 100.0)
+            profit = revenue * (gross_margin_pct / 100.0) - promo_cost - exec_cost
+            return revenue, profit
+
+        @st.cache_data(show_spinner=False)
+        def _threshold_from_curve():
+            """Recompute the local ±10% price curve and detect an inflection where revenue declines."""
+            steps_pct = np.linspace(-0.10, 0.10, 11)
+            revs = []
+            for dp in steps_pct:
+                pm = _price_mult_base * (1.0 + dp)
+                rev, _ = _revenue_profit(pm, _promo_prob_base)
+                revs.append(rev)
+            # Find first point to the right of 0 where revenue decreases relative to previous
+            idx0 = np.where(np.isclose(steps_pct, 0.0))[0][0]
+            decline_at = None
+            for k in range(idx0 + 1, len(steps_pct)):
+                if revs[k] < revs[k - 1]:
+                    decline_at = steps_pct[k]
+                    break
+            return steps_pct, revs, decline_at
+
+        # Limit the upper bound to the first local decline if one exists
+        steps_pct, revs, decline_at = _threshold_from_curve()
+        upper_cap = 1.10
+        if decline_at is not None:
+            # decline_at is in fractional terms (e.g., 0.06 = +6%)
+            upper_cap = min(upper_cap, 1.0 + float(decline_at))
+
+        price_steps = np.linspace(0.90*_price_mult_base, upper_cap*_price_mult_base, 7)
+        promo_steps = np.linspace(max(0.0, _promo_prob_base - 0.10), min(0.95, _promo_prob_base + 0.10), 7)
+        def _grid_recommendations():
+            # Baseline for deltas
+            base_rev, base_prof = _revenue_profit(_price_mult_base, _promo_prob_base)
+            # Search
+            cand = []
+            for pm in price_steps:
+                for pp in promo_steps:
+                    rev, prof = _revenue_profit(pm, pp)
+                    cand.append({
+                        "price_mult": pm,
+                        "promo_prob": pp,
+                        "Revenue": rev,
+                        "Profit": prof,
+                        "dRev": rev - base_rev,
+                        "dProf": prof - base_prof,
+                    })
+            df = pd.DataFrame(cand)
+            # distance from baseline (smaller is nicer when profits tie)
+            df["move_size"] = np.hypot(
+                (df["price_mult"]/_price_mult_base - 1.0) * 100.0,
+                (df["promo_prob"] - _promo_prob_base) * 100.0
+            )
+            # Sort by ΔProfit desc, then smaller move
+            df = df.sort_values(["dProf", "move_size"], ascending=[False, True]).reset_index(drop=True)
+            return df, base_rev, base_prof
+
+        def _threshold_from_curve():
+            """Recompute the local ±10% price curve and detect an inflection where revenue declines."""
+            steps_pct = np.linspace(-0.10, 0.10, 11)
+            revs = []
+            for dp in steps_pct:
+                pm = _price_mult_base * (1.0 + dp)
+                rev, _ = _revenue_profit(pm, _promo_prob_base)
+                revs.append(rev)
+            # Find first point to the right of 0 where revenue decreases relative to previous
+            idx0 = np.where(np.isclose(steps_pct, 0.0))[0][0]
+            decline_at = None
+            for k in range(idx0+1, len(steps_pct)):
+                if revs[k] < revs[k-1]:
+                    decline_at = steps_pct[k]
+                    break
+            return steps_pct, revs, decline_at
+
+        def _risk_level_from_stability():
+            # Uses your stability score across model forecasts if available
+            preds = st.session_state.get("preds_dict") or {}
+            try:
+                score, _ = stability_score_from_preds(preds)
+            except Exception:
+                score = 60.0
+            if score >= 80: return "Low", score
+            if score >= 60: return "Medium", score
+            return "High", score
+
+        # -------------------- Auto Recommendations ------------------------------------
+        st.markdown("### 🤖 Auto Recommendations")
+        rec_df, base_rev, base_prof = _grid_recommendations()
+
+        # Risk level from forecast stability (global, simple & consistent)
+        risk_level, stab_score = _risk_level_from_stability()
+
+        # Best option by ΔProfit
+        if rec_df.empty:
+            st.info("No valid recommendations in the ±10% price / ±10pp promo window.")
+            _best = None
+        else:
+            best_row = rec_df.iloc[0].copy()
+            pm_pct_best = (best_row["price_mult"]/_price_mult_base - 1.0) * 100.0
+            pp_pct_best = (best_row["promo_prob"] - _promo_prob_base) * 100.0
+
+            if risk_level == "Low":
+                # ✅ Low risk → give one clear optimal pick only
+                st.success(
+                    f"📈 **Optimal Strategy:** Price {pm_pct_best:+.1f}% & Promo {pp_pct_best:+.1f}pp → "
+                    f"ΔProfit **{best_row['dProf']:+,.0f}**, ΔRevenue {best_row['dRev']:+,.0f} "
+                    f"(Stability {stab_score:.0f}/100, {risk_level} risk)"
+                )
+                _best = best_row
+            else:
+                # ⚠️ Non-low risk → show optimal + safer alternatives
+                # Define “safer” = smaller move magnitudes from baseline, among good ΔProf
+                rec_df = rec_df.assign(
+                    move_size = (rec_df["price_mult"]-_price_mult_base).abs()
+                                + (rec_df["promo_prob"]-_promo_prob_base).abs()
+                )
+                # Consider top 10 by profit, then pick the 2 smallest moves (not equal to the best) with non-negative ΔProf
+                top10 = rec_df.head(10)
+                safer = (
+                    top10[top10.index != top10.index[0]]
+                    .query("dProf >= 0")
+                    .sort_values(["move_size","dProf"], ascending=[True, False])
+                    .head(2)
+                    .copy()
+                )
+
+                # Show the optimal first
+                st.warning(
+                    f"🏁 **Highest Profit (higher risk):** Price {pm_pct_best:+.1f}% & Promo {pp_pct_best:+.1f}pp → "
+                    f"ΔProfit **{best_row['dProf']:+,.0f}**, ΔRevenue {best_row['dRev']:+,.0f} "
+                    f"(Stability {stab_score:.0f}/100, {risk_level} risk)"
+                )
+
+                # Then offer safer alternatives
+                if not safer.empty:
+                    st.markdown("**Lower-risk alternatives:**")
+                    for i, r in safer.iterrows():
+                        pm_pct = (r["price_mult"]/_price_mult_base - 1.0) * 100.0
+                        pp_pct = (r["promo_prob"] - _promo_prob_base) * 100.0
+                        st.write(
+                            f"- Price {pm_pct:+.1f}%, Promo {pp_pct:+.1f}pp → "
+                            f"ΔProfit **{r['dProf']:+,.0f}**, ΔRevenue {r['dRev']:+,.0f} "
+                            f"(smaller move)"
+                        )
+                else:
+                    st.caption("No sufficiently safer alternatives with positive profit found in this window.")
+                _best = best_row
+
+        # -------------------- Threshold Insights --------------------------------------
+        st.markdown("### 📍 Threshold Insights")
+        steps_pct, revs, decline_at = _threshold_from_curve()
+        if decline_at is not None:
+            st.info(f"Revenue **starts to decline above** ~**{decline_at*100:.1f}%** price change (relative to baseline).")
+        else:
+            st.info("No clear decline within ±10% price window — revenue is near flat/monotonic in this band.")
+
+        # Show a small plot (no custom colors per your chart rules)
+        import matplotlib.pyplot as plt
+        fig = plt.figure(figsize=(8,3.5))
+        plt.plot(steps_pct*100.0, revs)
+        plt.axvline(0, linestyle="--")
+        plt.title("Projected Revenue vs Price Change (±10%)")
+        plt.xlabel("Price change (%)")
+        plt.ylabel("Revenue (horizon sum)")
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+
+        # -------------------- ROI & Risk Ranking --------------------------------------
+        st.markdown("### 💹 ROI & Risk Ranking")
+        risk_level, stab_score = _risk_level_from_stability()
+
+        # Define two primary levers compared to baseline: PRICE and PROMO (one-at-a-time moves)
+        lever_rows = []
+        if _best is not None:
+            # isolate price-only and promo-only deltas at same step as best (closest grid point)
+            pm_only_rev, pm_only_prof = _revenue_profit(_best["price_mult"], _promo_prob_base)
+            pr_only_rev, pr_only_prof = _revenue_profit(_price_mult_base, _best["promo_prob"])
+
+            pm_cost = price_change_cost_per_pct * abs((_best["price_mult"] - 1.0)*100.0)
+            pr_cost = promo_budget_per_week * ((_best["promo_prob"] - _promo_prob_base) * _h if _best["promo_prob"] > _promo_prob_base else 0.0)
+
+            lever_rows.append({
+                "Lever": "Price",
+                "ROI_%": 100.0 * ((pm_only_prof - base_prof) / max(pm_cost, 1e-9)),
+                "ΔProfit": pm_only_prof - base_prof,
+                "ΔCost": pm_cost,
+                "Risk": risk_level,
+            })
+            lever_rows.append({
+                "Lever": "Promo",
+                "ROI_%": 100.0 * ((pr_only_prof - base_prof) / max(pr_cost, 1e-9)) if pr_cost>0 else np.nan,
+                "ΔProfit": pr_only_prof - base_prof,
+                "ΔCost": pr_cost,
+                "Risk": risk_level,
+            })
+
+        tbl = pd.DataFrame(lever_rows) if lever_rows else pd.DataFrame(columns=["Lever","ROI_%","ΔProfit","ΔCost","Risk"])
+        st.dataframe(tbl.round(2), use_container_width=True)
+
+        # -------------------- Executive Summary Paragraph -----------------------------
+        st.markdown("### 🧾 AI Executive Summary")
+        # Trend vs recent history
+        _recent_k = min(12, len(_hist))
+        recent_mean = float(_hist.tail(_recent_k)["sales"].mean()) if _recent_k>0 else np.nan
+        # Produce the chosen (best) recommendation in words
+        if _best is not None:
+            pm_delta = (_best["price_mult"]/_price_mult_base - 1.0) * 100.0
+            pp_delta = (_best["promo_prob"] - _promo_prob_base) * 100.0
+            driver = "a targeted price move" if abs(pm_delta) >= abs(pp_delta) else "calibrated promo intensity"
+            trend_pct = ( (base_rev - (recent_mean*_last_price*_h)) / max(recent_mean*_last_price*_h, 1e-9) ) * 100.0 if np.isfinite(recent_mean) else 0.0
+            summary = (
+                f"Sales are projected to change by {trend_pct:+.1f}% next quarter. "
+                f"The model recommends focusing on {driver}, adjusting price by {pm_delta:+.1f}% "
+                f"and promo probability by {pp_delta:+.1f}pp. "
+                f"This yields an estimated profit impact of { _best['dProf']:+,.0f} "
+                f"and revenue change of { _best['dRev']:+,.0f}. "
+                f"Forecast stability is rated {stab_score:.0f}/100 ({risk_level} risk level)."
+            )
+        else:
+            summary = "Forecast produced no dominant strategy within ±10%/±10pp; expect stable outcomes under current settings."
+        st.write(summary)
+
+        
+        # ==============================================================================   
             
 
             
         # ---- end fallback guard ----
 
-        # ---------------------------------------------------------------------------
-        # 📊 Stats (safe)
-        st.subheader("📊 Stats")
-
-        # Get the final forecast safely
-        fc_tmp = st.session_state.get("final_fc")
-        if fc_tmp is None:
-            # If a local variable exists (same scope), use it; otherwise tell the user what to do
-            try:
-                fc_tmp = final_fc
-            except NameError:
-                st.info("Pick or generate a forecast above first (Quick Forecast or Final forecast).")
-                st.stop()
-
-        # recent window size
-        k = min(12, max(4, int(len(st.session_state.bt.get("feat", [])) * 0.15)))
-
-        # Align to dates (ensure datetime index)
-        recent_actual = (
-            st.session_state.raw_df.copy()
-            .assign(date=pd.to_datetime(st.session_state.raw_df["date"]))
-            .set_index("date")
-            .tail(k)["sales"]
-        )
-
-        recent_pred = (
-            fc_tmp.copy()
-            .assign(date=pd.to_datetime(fc_tmp["date"]))
-            .set_index("date")
-            .reindex(recent_actual.index)["forecast"]
-            .bfill().ffill()
-        )
-
-        stats = score_table(recent_actual.values, recent_pred.values, seasonality=52)
-        st.write(f"**Recent performance (vs last ~{len(recent_actual)} weeks)**")
-        st.json(stats)
-
-        # ===== Extra Data Insights & Strategy =====
-        st.subheader("📈 Data Insights")
-        df_hist = st.session_state.raw_df.copy().sort_values("date").reset_index(drop=True)
-        sales = df_hist["sales"].astype(float).values
-
-        expected_fc = float(np.nansum(fc_tmp["forecast"]))
-        avg_fc = float(np.nanmean(fc_tmp["forecast"]))
-        avg_sales = float(np.nanmean(sales))
-        min_sales, max_sales = float(np.nanmin(sales)), float(np.nanmax(sales))
-        std_sales = float(np.nanstd(sales))
-        vol_ratio = std_sales / max(avg_sales, 1e-9)
-
-        st.markdown(f"""
-        - **Average Weekly Sales:** {avg_sales:,.0f}  
-        - **Min / Max Weekly Sales:** {min_sales:,.0f} / {max_sales:,.0f}  
-        - **Std Dev (Volatility):** {std_sales:,.0f} ({vol_ratio:.2f}× mean)  
-        - **Forecast Horizon (Total Sales):** {expected_fc:,.0f}  
-        - **Forecast Horizon (Avg per Week):** {avg_fc:,.0f}  
-        """)
+        # --------------------------------------------------------------------------
 
         # --- Signals ---
         lift_pct, price_elasticity, season_acf, trend_slope = 0.0, np.nan, np.nan, 0.0
-
+        sales = _hist["sales"].astype(float).to_numpy()
         # Promo lift
-        if "is_promo" in df_hist.columns and df_hist["is_promo"].sum() >= 5:
-            promo_sales = df_hist.loc[df_hist["is_promo"] == 1, "sales"].mean()
-            nonpromo_sales = df_hist.loc[df_hist["is_promo"] == 0, "sales"].mean()
-            if pd.notna(nonpromo_sales) and nonpromo_sales > 0:
-                lift_pct = float((promo_sales - nonpromo_sales) / nonpromo_sales * 100.0)
-                st.write(f"**Promo Lift Estimate:** {lift_pct:.1f}%")
+        if "is_promo" in _hist.columns:
+            # normalize the promo flag to clean 0/1 ints
+            promo_flag = pd.to_numeric(_hist["is_promo"], errors="coerce").fillna(0).round().astype(int)
+            if promo_flag.sum() >= 5 and (promo_flag == 0).sum() >= 5:
+                promo_sales     = _hist.loc[promo_flag.eq(1), "sales"].astype(float).mean()
+                nonpromo_sales  = _hist.loc[promo_flag.eq(0), "sales"].astype(float).mean()
+                if pd.notna(nonpromo_sales) and nonpromo_sales > 0:
+                    lift_pct = float((promo_sales - nonpromo_sales) / nonpromo_sales * 100.0)
+                    st.write(f"**Promo Lift Estimate:** {lift_pct:.1f}%")
 
         # Price elasticity (quick OLS on logs with seasonal sin/cos and promo)
-        if "price" in df_hist.columns and df_hist["price"].notna().sum() > 20:
-            log_y = np.log(np.clip(df_hist["sales"].astype(float).values, 1e-6, None))
-            log_p = np.log(np.clip(df_hist["price"].astype(float).ffill().values, 1e-6, None))
-            week = pd.to_datetime(df_hist["date"]).dt.isocalendar().week.astype(int).values
+        if "price" in _hist.columns and _hist["price"].notna().sum() > 20:
+            log_y = np.log(np.clip(_hist["sales"].astype(float).values, 1e-6, None))
+            log_p = np.log(np.clip(_hist["price"].astype(float).ffill().values, 1e-6, None))
+            week = pd.to_datetime(_hist["date"]).dt.isocalendar().week.astype(int).values
             s_sin = np.sin(2*np.pi * week / 52.0)
             s_cos = np.cos(2*np.pi * week / 52.0)
-            promo = df_hist["is_promo"].astype(float).values if "is_promo" in df_hist.columns else np.zeros_like(log_y)
+            promo = _hist["is_promo"].astype(float).values if "is_promo" in _hist.columns else np.zeros_like(log_y)
             X = np.column_stack([np.ones_like(log_y), log_p, promo, s_sin, s_cos])
             try:
                 beta, *_ = np.linalg.lstsq(X, log_y, rcond=None)

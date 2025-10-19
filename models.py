@@ -191,7 +191,7 @@ def fit_lgbm(Xtr: pd.DataFrame, ytr: pd.Series):
         colsample_bytree=0.9,
         random_state=0,
         verbose=-1,
-        n_jobs=1
+        n_jobs=-1
     )
     user = TUNED_PARAMS.get("LightGBM", {})
     cfg = {**base, **user}
@@ -217,7 +217,7 @@ def fit_xgb(X_train: pd.DataFrame, y_train: pd.Series):
         colsample_bytree=0.8,
         reg_lambda=1.0,
         random_state=42,
-        n_jobs=1
+        n_jobs=-1
     )
     user = TUNED_PARAMS.get("XGBoost", {})
     cfg = {**base, **user}
