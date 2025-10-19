@@ -173,11 +173,13 @@ def fit_enet(Xtr: pd.DataFrame, ytr: pd.Series):
         ("scaler", StandardScaler(with_mean=True, with_std=True)),
         ("enet", ElasticNetCV(
             l1_ratio=[0.1, 0.5, 0.9],
-            cv=min(5, max(2, len(ytr)//4)),
-            n_alphas=60,
-            max_iter=5000,
-            tol=1e-4,
-            random_state=0
+            # Lighter inner-CV for small cloud CPUs; also uses new 'alphas' int form
+            cv=3,
+            alphas=100,
+            max_iter=3000,
+            tol=1e-3,
+            random_state=0,
+            n_jobs=1
         ))
     ])
     pipe.fit(Xtr, ytr)
@@ -204,7 +206,7 @@ def fit_lgbm(Xtr: pd.DataFrame, ytr: pd.Series):
         colsample_bytree=0.9,
         random_state=0,
         verbose=-1,
-        n_jobs=-1
+        n_jobs=1
     )
     user = TUNED_PARAMS.get("LightGBM", {})
     cfg = {**base, **user}
@@ -230,7 +232,7 @@ def fit_xgb(X_train: pd.DataFrame, y_train: pd.Series):
         colsample_bytree=0.8,
         reg_lambda=1.0,
         random_state=42,
-        n_jobs=-1
+        n_jobs=1
     )
     user = TUNED_PARAMS.get("XGBoost", {})
     cfg = {**base, **user}
@@ -439,20 +441,13 @@ def backtest_models(
             pass
 
         # Prophet (uses date/sales + optional price/is_promo; ignores engineered lags)
-        if _HAS_PROPHET:
+        if "Prophet" in models_to_try:
             try:
                 df_tr = train[["date", "sales"]].copy()
                 for c in ["price", "is_promo"]:
                     if c in train.columns:
                         df_tr[c] = train[c]
                 p_m = fit_prophet(df_tr)  # fit from df with date/sales(+drivers)
-                # build future for horizon with carried-forward drivers
-                future_dates = pd.date_range(train["date"].max() + pd.Timedelta(days=7), periods=horizon, freq="W")
-                df_future = pd.DataFrame({"date": future_dates})
-                for c in ["price", "is_promo"]:
-                    if c in train.columns:
-                        df_future[c] = float(train[c].iloc[-1])
-                # Prophet helper ignores 'date' name, it will use carried values
                 preds = predict_prophet(p_m, steps=horizon)
                 per_model_errs["Prophet"].append(score_fn(yv, preds))
                 fold_rows.append({"fold_end": end, "model": "Prophet", "metric": metric, "score": per_model_errs["Prophet"][-1]})
