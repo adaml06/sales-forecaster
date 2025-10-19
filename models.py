@@ -45,6 +45,19 @@ try:
 except Exception:
     _HAS_PROPHET = False
 
+# --- Prophet readiness check (skip slow first-time bootstrap on cloud) ---
+import os
+
+def _prophet_ready() -> bool:
+    if not _HAS_PROPHET:
+        return False
+    try:
+        import cmdstanpy  # Prophet >=1.1 uses cmdstanpy
+        p = cmdstanpy.cmdstan_path()
+        return bool(p) and os.path.exists(p) and len(os.listdir(p)) > 0
+    except Exception:
+        return False
+
 # --- v1.3: tuned params store -----------------------------------------------
 TUNED_PARAMS: dict[str, dict] = {}   # e.g. {"LightGBM": {...}, "XGBoost": {...}}
 
@@ -359,7 +372,7 @@ def backtest_models(
     if n >= seasonality:
         models_to_try.append("sNaive")
     models_to_try.append("HoltWintersSafe")
-    if _HAS_PROPHET:
+    if _HAS_PROPHET and _prophet_ready():
         models_to_try.append("Prophet")
     if allowed_models:
         models_to_try = [m for m in models_to_try if m in set(allowed_models)]

@@ -15,6 +15,9 @@ from models import (
 from utils import plot_history_forecast, combine_stats_row, score_table
 from utils import stability_score_from_preds, detect_regime_shift
 from sample_data_ml import gen_weekly_ml, gen_weekly_profile
+from models import _HAS_PROPHET
+from models import _prophet_ready as _p_ready
+
 
 def _final_choice_from_radio(choice, preds_dict, ens=None):
     """
@@ -289,8 +292,14 @@ def _confidence_badge(metric_name: str, best_error: float) -> tuple[str, str]:
     return "🔴 Low Confidence", f"{m} ≈ {x:.2f}"
 st.set_page_config(page_title="Sales Forecaster", layout="wide")
 st.title("🧠 Sales Forecaster (Weekly)")
+
+# ---- Model options depend on Prophet availability on this host ----
+# (_HAS_PROPHET and the backend readiness check come from models.py; both already imported above)
+prophet_ok = bool(_HAS_PROPHET) and bool(_p_ready())
+_MODEL_OPTIONS = ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters"] + (["Prophet"] if prophet_ok else [])
+_DEFAULT_MODELS = list(_MODEL_OPTIONS)
+
 # ---- Session defaults (so Results/Backtest never KeyError) ----
-_DEFAULT_MODELS = ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"]
 st.session_state.setdefault("metric", "SMAPE")
 st.session_state.setdefault("horizon", 12)
 st.session_state.setdefault("folds", 4)
@@ -299,6 +308,8 @@ st.session_state.setdefault("include_models", _DEFAULT_MODELS)
 with st.sidebar:
     st.header("⚙️ Display Mode")
     simple_mode = st.toggle("Simple Mode", value=True, help="Hide advanced knobs until you need them.")
+    if not prophet_ok:
+        st.caption("⚠️ Prophet isn’t available/ready on this host, so it’s hidden from the model list.")
     st.divider()
     with st.expander("📖 Glossary", expanded=False):
         st.markdown("""
@@ -463,12 +474,12 @@ with tab_models:
     st.subheader("2) Configure models & backtest")
 
     if simple_mode:
-    # v1.1 — Simple Mode: minimal knobs
+        # v1.1 — Simple Mode: minimal knobs
         metric  = st.selectbox("Metric (lower is better)", ["SMAPE","MAPE","MAE","RMSE"], index=0,
-                               help="Pick how we score models.")
+                            help="Pick how we score models.")
         horizon = st.selectbox("Forecast horizon (weeks)", [4,8,12,24], index=2)
         folds   = 4  # sensible default; hidden in simple mode
-        include_models = ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"]
+        include_models = _DEFAULT_MODELS
         st.session_state.metric = metric
         st.session_state.horizon = int(horizon)
         st.session_state.folds = int(folds)
@@ -488,9 +499,9 @@ with tab_models:
                 use_holidays = st.checkbox("Use holidays (US)", value=True, disabled=True,
                                        help="Holiday regressor is already baked into the features.")
                 include_models = st.multiselect(
-                     "Models to consider",
-                   ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"],
-                    default=["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"],
+                    "Models to consider",
+                    _MODEL_OPTIONS,
+                    default=_DEFAULT_MODELS,
                     help="Uncheck anything you don’t want in the bake-off."
                 )
                 st.markdown("---")
