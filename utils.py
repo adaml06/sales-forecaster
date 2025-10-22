@@ -12,8 +12,8 @@ def mape(y_true, y_pred):
 def smape(y_true, y_pred):
     y_true = np.asarray(y_true, float)
     y_pred = np.asarray(y_pred, float)
-    denom = np.clip((np.abs(y_true)+np.abs(y_pred)), 1e-9, None)
-    return float(np.mean(2*np.abs(y_pred-y_true)/denom)*100)
+    denom = np.clip((np.abs(y_true)+np.abs(y_pred)) / 2.0, 1e-9, None)
+    return float(np.mean(np.abs(y_pred - y_true) / denom) * 100.0)
 
 def mae(y_true, y_pred):
     return float(np.mean(np.abs(np.asarray(y_true)-np.asarray(y_pred))))
@@ -47,8 +47,14 @@ def combine_stats_row(model_name, y_true, y_pred, seasonality=52):
 def plot_history_forecast(df_hist, forecast_df, title="History + Forecast"):
     fig = plt.figure(figsize=(10,4))
     plt.plot(df_hist["date"], df_hist["sales"], label="Actual")
+    unit = "pts"
     if len(forecast_df):
-        plt.plot(forecast_df["date"], forecast_df["forecast"], label=f"Forecast ({len(forecast_df)}w)")
+        # infer days vs weeks by typical spacing
+        dts = pd.to_datetime(forecast_df["date"]).sort_values().to_numpy()
+        if len(dts) >= 2:
+            delta_days = np.median(np.diff(dts).astype("timedelta64[D]").astype(int))
+            unit = "days" if delta_days <= 2 else "weeks"
+        plt.plot(forecast_df["date"], forecast_df["forecast"], label=f"Forecast ({len(forecast_df)} {unit})")
         if "lower" in forecast_df and "upper" in forecast_df:
             plt.fill_between(forecast_df["date"], forecast_df["lower"], forecast_df["upper"], alpha=0.2, label="Interval")
     plt.title(title)

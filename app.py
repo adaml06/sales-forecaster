@@ -6,11 +6,13 @@ import streamlit as st
 
 from features import build_features, data_quality_report
 from models import (
-    backtest_models,
-    fit_naive, predict_naive,
-    fit_snaive, predict_snaive,
-    fit_holt, predict_holt,
-    train_full_and_forecast
+    _clean_xy,
+    train_full_and_forecast,
+    fit_ols, predict_ols,
+    fit_enet, predict_enet,
+    interval_from_backtest_ape,   
+    summarize_change,
+    backtest_models,             
 )
 from utils import plot_history_forecast, combine_stats_row, score_table
 from utils import stability_score_from_preds, detect_regime_shift
@@ -18,6 +20,9 @@ from sample_data_ml import gen_weekly_ml, gen_weekly_profile
 from models import _HAS_PROPHET
 from models import _prophet_ready as _p_ready
 
+st.set_page_config(page_title="Sales Forecaster", layout="wide")
+_title = st.empty()
+_title.markdown("## 🧠 Sales Forecaster")  # neutral until data is loaded
 
 def _final_choice_from_radio(choice, preds_dict, ens=None):
     """
@@ -196,8 +201,9 @@ def run_monte_carlo_cached(
 
     # 2) Build a base future driver stub once
     last_feat_date = pd.to_datetime(feat_all["date"]).max()
-    future_dates = pd.date_range(last_feat_date + pd.Timedelta(weeks=1),
-                             periods=int(horizon), freq="W")
+    _freq = st.session_state.get("freq", "W")
+    step = pd.Timedelta(days=1) if _freq == "D" else pd.Timedelta(weeks=1)
+    future_dates = pd.date_range(last_feat_date + step, periods=int(horizon), freq=_freq)
     base_future = pd.DataFrame({"date": future_dates})
     for c in ["price", "is_promo"]:
         if c in raw_df.columns:
@@ -290,8 +296,7 @@ def _confidence_badge(metric_name: str, best_error: float) -> tuple[str, str]:
     if x <= green:   return "🟢 High Confidence", f"{m} ≈ {x:.2f}"
     if x <= yellow:  return "🟡 Medium Confidence", f"{m} ≈ {x:.2f}"
     return "🔴 Low Confidence", f"{m} ≈ {x:.2f}"
-st.set_page_config(page_title="Sales Forecaster", layout="wide")
-st.title("🧠 Sales Forecaster (Weekly)")
+
 
 # ---- Model options depend on Prophet availability on this host ----
 # (_HAS_PROPHET and the backend readiness check come from models.py; both already imported above)
@@ -300,7 +305,7 @@ _MODEL_OPTIONS = ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWin
 _DEFAULT_MODELS = list(_MODEL_OPTIONS)
 
 # ---- Session defaults (so Results/Backtest never KeyError) ----
-st.session_state.setdefault("metric", "SMAPE")
+st.session_state.setdefault("metric", "MAE")
 st.session_state.setdefault("horizon", 12)
 st.session_state.setdefault("folds", 4)
 st.session_state.setdefault("include_models", _DEFAULT_MODELS)
@@ -333,13 +338,43 @@ with tab_data:
         if "raw_df" not in st.session_state:
             st.session_state.raw_df = None
         if file:
-            df = pd.read_csv(file, parse_dates=["date"])
+            df = pd.read_csv(file)
+            # normalize headers (case/whitespace) and map common aliases
+            df.columns = df.columns.str.strip().str.lower()
+            alias = {"qty":"sales","units":"sales","sales_qty":"sales","revenue":"sales"}
+            df = df.rename(columns={k:v for k,v in alias.items() if k in df.columns})
+
+            required = {"date","sales"}
+            missing = required - set(df.columns)
+            if missing:
+                st.error(f"Missing required columns: {', '.join(sorted(missing))}. Found: {list(df.columns)}")
+                st.stop()
+
+            # safe datetime + sort; drop bad dates instead of exploding later
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
             st.session_state.raw_df = df
+
+            # infer & store cadence/seasonality now that data exists
+            from features import infer_freq, FREQ_DEFAULTS
+            freq = infer_freq(st.session_state.raw_df["date"])
+            st.session_state.freq = freq
+            st.session_state.seasonality = FREQ_DEFAULTS.get(freq, {"seasonality": 52})["seasonality"]
+
+            
+            _hlabel = "Daily" if st.session_state.get("freq","W")=="D" else "Weekly"
+            st.title(f"🧠 Sales Forecaster ({_hlabel})")
+
     with col2:
         if simple_mode:
             # Keep the existing one-click generator
             if st.button("Generate sample data"):
                 st.session_state.raw_df = gen_weekly_ml(n_weeks=260, seed=np.random.randint(0, 99999))
+                from features import infer_freq, FREQ_DEFAULTS
+                freq = infer_freq(st.session_state.raw_df["date"])
+                st.session_state.freq = freq
+                st.session_state.seasonality = FREQ_DEFAULTS.get(freq, {"seasonality": 52})["seasonality"]
         else:
             # Advanced Mode: presets + custom controls
             with st.expander("🔬 Advanced sample generator", expanded=True):
@@ -427,8 +462,13 @@ with tab_data:
                                 df.loc[i, "sales"] = (df.loc[i, "sales"] * factor).round(2)
 
                     st.session_state.raw_df = df
+                    from features import infer_freq, FREQ_DEFAULTS
+                    freq = infer_freq(st.session_state.raw_df["date"])
+                    st.session_state.freq = freq
+                    st.session_state.seasonality = FREQ_DEFAULTS.get(freq, {"seasonality": 52})["seasonality"]
     if st.session_state.raw_df is not None:
         st.write("Preview:")
+        
         st.dataframe(st.session_state.raw_df.head(12), use_container_width=True)
         q = data_quality_report(st.session_state.raw_df)
         color = "🟢" if q["missing"]==0 and q["gaps"]==0 else ("🟡" if q["missing"]<3 and q["gaps"]<2 else "🔴")
@@ -440,6 +480,46 @@ with tab_data:
                 st.warning("⚠️ Missing values in `sales` detected — consider filling or removing them for best results.")
         if q["gaps"] > 0:
                 st.warning("⚠️ Irregular weekly gaps detected — the app will reindex, but results may be noisier.")
+    # --- One-click: Fill historical weekly gaps (resample & impute history only) ---
+        freq = st.session_state.get("freq", "W")
+
+        def _post_fill_report():
+            q2 = data_quality_report(st.session_state.raw_df)
+            st.success(
+                f"Filled. Rows: {q2['rows']} | Range: {q2['start']} → {q2['end']} | "
+                f"Zeros: {q2['zeros']} | Missing: {q2['missing']} | Gaps: {q2['gaps']}"
+            )
+            st.dataframe(st.session_state.raw_df.tail(12), use_container_width=True)
+            # re-infer cadence after filling (data length/range can change)
+            from features import infer_freq, FREQ_DEFAULTS
+            new_freq = infer_freq(st.session_state.raw_df["date"])
+            st.session_state.freq = new_freq
+            st.session_state.seasonality = FREQ_DEFAULTS.get(new_freq, {"seasonality": 52})["seasonality"]
+
+        if freq == "W":
+            if st.button("🧩 Fill historical weekly gaps"):
+                from features import make_weekly_and_fill
+                st.session_state.raw_df = make_weekly_and_fill(st.session_state.raw_df)
+                _post_fill_report()
+        else:  # treat everything else as daily for now
+            if st.button("🧩 Fill historical daily gaps"):
+                from features import make_daily_and_fill
+                st.session_state.raw_df = make_daily_and_fill(st.session_state.raw_df)
+                _post_fill_report()
+            # show the new quality after filling
+            q2 = data_quality_report(st.session_state.raw_df)
+            color2 = "🟢" if q2["missing"]==0 and q2["gaps"]==0 else ("🟡" if q2["missing"]<3 and q2["gaps"]<2 else "🔴")
+            st.success(
+                f"Filled. Rows: {q2['rows']} | Range: {q2['start']} → {q2['end']} | "
+                f"Zeros: {q2['zeros']} | Missing: {q2['missing']} | Gaps: {q2['gaps']}"
+            )
+            st.dataframe(st.session_state.raw_df.tail(12), use_container_width=True)
+            # re-infer cadence after filling (data length/range can change)
+            from features import infer_freq, FREQ_DEFAULTS
+            freq = infer_freq(st.session_state.raw_df["date"])
+            st.session_state.freq = freq
+            st.session_state.seasonality = FREQ_DEFAULTS.get(freq, {"seasonality": 52})["seasonality"]
+            
         # v1.1 — Quick Forecast
         st.subheader("🚀 Quick Forecast")
         if st.button("Run Quick Forecast"):
@@ -454,10 +534,16 @@ with tab_data:
                     feature_cols=[],            # models.py recomputes features internally
                     model_name="LightGBM",
                     steps=quick_h,
-                    seasonality=52,
+                    seasonality=st.session_state.get("seasonality", 52),
+                    freq=st.session_state.get("freq","W"),
                 )
                 st.session_state.final_fc = df_fc
-                fig = plot_history_forecast(df_hist, df_fc, title=f"Quick Forecast ({quick_h} weeks, LightGBM)")
+                # --- NEW: graceful handling when no forecast is produced ---
+                if not isinstance(df_fc, pd.DataFrame) or df_fc.empty:
+                    st.error("No forecast was produced. Check data quality (dates, sales) or try a shorter horizon.")
+                    st.stop()
+                _hlabel = "days" if st.session_state.get("freq","W")=="D" else "weeks"
+                fig = plot_history_forecast(df_hist, df_fc, title=f"Quick Forecast ({quick_h} {_hlabel}, LightGBM)")
                 st.pyplot(fig, use_container_width=True)
 
                 # confidence badge (uses prior backtest if available)
@@ -469,15 +555,21 @@ with tab_data:
                 st.markdown(f"**Confidence:** {badge}  \n_{badge_sub}_")
                 st.success("Done! Switch to **Backtest, Pick & Results** to compare models or refine.")
 
+
+
+
 # ---------------- Models Tab ----------------
+
+
 with tab_models:
     st.subheader("2) Configure models & backtest")
 
     if simple_mode:
         # v1.1 — Simple Mode: minimal knobs
-        metric  = st.selectbox("Metric (lower is better)", ["SMAPE","MAPE","MAE","RMSE"], index=0,
+        metric  = st.selectbox("Metric (lower is better)", ["SMAPE","MAPE","MAE","RMSE"], index=2,
                             help="Pick how we score models.")
-        horizon = st.selectbox("Forecast horizon (weeks)", [4,8,12,24], index=2)
+        h_label = "days" if st.session_state.get("freq", "W") == "D" else "weeks"
+        horizon = st.slider(f"Forecast horizon ({h_label})", min_value=4, max_value=52 if h_label=="weeks" else 90, value=12)   
         folds   = 4  # sensible default; hidden in simple mode
         include_models = _DEFAULT_MODELS
         st.session_state.metric = metric
@@ -550,8 +642,10 @@ with tab_models:
                             except Exception as _e:
                                 st.caption(f"(XGBoost tuning skipped: {_e})")
                 errs, fold_tbl, best = backtest_models(
-                    feat, fcols, folds=folds, horizon=horizon, metric=metric, seasonality=52,
-                    allowed_models=allowed
+                    feat, fcols,
+                    folds=folds, horizon=horizon, metric=metric,
+                    seasonality=st.session_state.get("seasonality", 52),
+                    allowed_models=allowed,
                 )
                 st.session_state.bt = {"errors": errs, "folds": fold_tbl, "best": best, "feat": feat, "fcols": fcols}
                 st.success(f"Backtest done. Best (avg): **{best}**" if best else "Backtest done.")
@@ -576,7 +670,7 @@ with tab_bpr:
     st.markdown("## 📈 Final Forecast")
 
     # 1) Read all knobs from session (defined on the Models tab)
-    metric            = st.session_state.get("metric", "SMAPE")
+    metric            = st.session_state.get("metric", "MAE")
     horizon           = int(st.session_state.get("horizon", 12))
     folds             = int(st.session_state.get("folds", 6))
     include_models    = st.session_state.get(
@@ -593,8 +687,9 @@ with tab_bpr:
     hist_df = st.session_state.raw_df.copy().sort_values("date")
     feat, fcols = build_features(hist_df.copy())
     last_feat_date = pd.to_datetime(feat["date"]).max()
-    future_dates = pd.date_range(last_feat_date + pd.Timedelta(weeks=1), periods=int(horizon), freq="W")
-
+    _freq = st.session_state.get("freq", "W")
+    step = pd.Timedelta(days=1) if _freq == "D" else pd.Timedelta(weeks=1)
+    future_dates = pd.date_range(last_feat_date + step, periods=int(horizon), freq=_freq)
     # 3) Create a deterministic future driver stub (Monte Carlo will randomize later)
     future_df = pd.DataFrame({"date": future_dates})
     if "price" in hist_df.columns:
@@ -614,7 +709,9 @@ with tab_bpr:
     train_feat  = final_feat[~final_feat["date"].isin(future_dates)]
     Xtr, ytr = train_feat[final_fcols], train_feat["sales"]
     Xf       = future_feat[final_fcols]
-
+    # Ensure finite matrices for all models on Results tab
+    Xtr, ytr = _clean_xy(Xtr, ytr, fill=0.0)
+    Xf       = _clean_xy(Xf,  fill=0.0)
     # 6) If features dropped rows (rare on short histories), use robust fallback for model training
     use_fallback = future_feat.empty or train_feat.empty or Xtr.shape[0]==0 or Xf.shape[0]==0
 
@@ -634,32 +731,49 @@ with tab_bpr:
 
     # sNaive (seasonal)
     if "sNaive" in include_models:
-        snaive_m = fit_snaive(hist_df["sales"], seasonality=52)
+        snaive_m = fit_snaive(hist_df["sales"], seasonality=st.session_state.get("seasonality", 52))
         if snaive_m is not None:
             preds["sNaive"] = pd.DataFrame({"date": future_dates, "forecast": predict_snaive(snaive_m, horizon)})
 
+
+    
+
     # OLS / Elastic / LightGBM / XGBoost use feature path if available; otherwise robust fallback
+        # OLS (pipeline with imputer; robust to stray NaNs)
     if "OLS" in include_models:
         try:
             if use_fallback:
-                df_fc = train_full_and_forecast(hist_df, build_features, final_fcols, "OLS", steps=horizon, seasonality=52)
+                df_fc = train_full_and_forecast(
+                    hist_df, build_features, final_fcols, "OLS", steps=horizon,
+                    seasonality=st.session_state.get("seasonality", 52),
+                    freq=st.session_state.get("freq","W"),
+                )
                 preds["OLS"] = df_fc
             else:
-                from sklearn.linear_model import LinearRegression
-                m = LinearRegression().fit(Xtr, ytr)
-                preds["OLS"] = pd.DataFrame({"date": future_feat["date"], "forecast": m.predict(Xf)})
+                m = fit_ols(Xtr, ytr)  # uses SimpleImputer inside
+                preds["OLS"] = pd.DataFrame({
+                    "date": future_feat["date"],
+                    "forecast": predict_ols(m, Xf)
+                })
         except Exception as e:
             st.info(f"OLS skipped: {e}")
 
+    # ElasticNet (pipeline with imputer + scaler; robust to stray NaNs)
     if "Elastic" in include_models:
         try:
             if use_fallback:
-                df_fc = train_full_and_forecast(hist_df, build_features, final_fcols, "ElasticNet", steps=horizon, seasonality=52)
+                df_fc = train_full_and_forecast(
+                    hist_df, build_features, final_fcols, "Elastic", steps=horizon,
+                    seasonality=st.session_state.get("seasonality", 52),
+                    freq=st.session_state.get("freq","W"),
+                )
                 preds["Elastic"] = df_fc
             else:
-                from sklearn.linear_model import ElasticNet
-                m = ElasticNet(alpha=0.0005, l1_ratio=0.1, max_iter=5000).fit(Xtr, ytr)
-                preds["Elastic"] = pd.DataFrame({"date": future_feat["date"], "forecast": m.predict(Xf)})
+                m = fit_enet(Xtr, ytr)  # has SimpleImputer + StandardScaler + ElasticNetCV
+                preds["Elastic"] = pd.DataFrame({
+                    "date": future_feat["date"],
+                    "forecast": predict_enet(m, Xf)
+                })
         except Exception as e:
             st.info(f"Elastic skipped: {e}")
 
@@ -667,7 +781,11 @@ with tab_bpr:
         try:
             from models import fit_lgbm, predict_lgbm
             if use_fallback:
-                df_fc = train_full_and_forecast(hist_df, build_features, final_fcols, "LightGBM", steps=horizon, seasonality=52)
+                df_fc = train_full_and_forecast(
+                    hist_df, build_features, final_fcols, "LightGBM", steps=horizon,
+                    seasonality=st.session_state.get("seasonality", 52),
+                    freq=st.session_state.get("freq","W"),
+                )
                 preds["LightGBM"] = df_fc
             else:
                 m = fit_lgbm(Xtr, ytr)
@@ -679,7 +797,11 @@ with tab_bpr:
         try:
             from models import fit_xgb, predict_xgb
             if use_fallback:
-                df_fc = train_full_and_forecast(hist_df, build_features, final_fcols, "XGBoost", steps=horizon, seasonality=52)
+                df_fc = train_full_and_forecast(
+                    hist_df, build_features, final_fcols, "XGBoost", steps=horizon,
+                    seasonality=st.session_state.get("seasonality", 52),
+                    freq=st.session_state.get("freq","W"),
+                )
                 preds["XGBoost"] = df_fc
             else:
                 m = fit_xgb(Xtr, ytr)
@@ -689,7 +811,7 @@ with tab_bpr:
 
     if "HoltWinters" in include_models:
         try:
-            holt_m = fit_holt(hist_df["sales"], seasonality=52)
+            holt_m = fit_holt(hist_df["sales"], seasonality=st.session_state.get("seasonality", 52))
             preds["HoltWinters"] = pd.DataFrame({"date": future_dates, "forecast": predict_holt(holt_m, horizon)})
         except Exception as e:
             st.info(f"HoltWinters skipped: {e}")
@@ -800,15 +922,16 @@ with tab_bpr:
             "- **Bootstrap residuals:** Re-samples recent forecast errors and adds them to the baseline forecast. "
             "This reflects the error you’ve actually seen in the past.\n"
             "- **LightGBM quantiles:** Trains special models to predict the **10th** and **90th** percentile forecasts. "
-            "This is faster and more model-aware when feature rows are available."
+            "This is faster and more model-aware when feature rows are available.\n"
+            "- **Relative (from backtest):** Uses the winning model’s backtest % error as a **scale-aware band** around the forecast."
         )
 
     interval_method = st.radio(
         "Choose uncertainty method:",
-        ["Bootstrap residuals", "LightGBM quantiles"],
+        ["Bootstrap residuals", "LightGBM quantiles", "Relative (from backtest)"],
         horizontal=True,
         index=0,
-        help="Bootstrap = resample past residuals. Quantiles = model-based 10th/90th percentiles."
+        help="Relative = uses the winning model’s backtest % error to scale bands."
     )
     fc = final_fc.copy()
     try:
@@ -817,6 +940,18 @@ with tab_bpr:
             q90 = fit_lgbm_quantile(Xtr, ytr, alpha=0.90)
             fc["lower"] = predict_lgbm_quantile(q10, Xf)
             fc["upper"] = predict_lgbm_quantile(q90, Xf)
+
+        elif interval_method == "Relative (from backtest)":
+            # Use the chosen model’s backtest error as a relative half-width.
+            # If the user picked 'Ensemble', fall back to the best single model’s error.
+            errs = st.session_state.bt.get("errors", {})
+            name_map = {"Elastic": "ElasticNet", "HoltWinters": "HoltWintersSafe"}
+            key = name_map.get(chosen_name, chosen_name)
+            ape_percent = float(errs.get(key, np.nan))  # SMAPE/MAPE are %; MAE/RMSE will still work as a rough scale
+            lower, upper, q = interval_from_backtest_ape(fc["forecast"].to_numpy(dtype=float), ape_percent)
+            fc["lower"] = lower
+            fc["upper"] = upper
+            st.caption(f"Relative bands built from backtest of **{key}**: ~{(ape_percent if np.isfinite(ape_percent) else 35):.1f}% → half-width {q*100:.0f}%")
         else:
             # small bootstrap on recent residuals
             k = min(26, max(8, len(hist_df) // 6))
@@ -852,6 +987,29 @@ with tab_bpr:
                 sim[b, :] = base + noise
             fc["lower"] = np.percentile(sim, 10, axis=0)
             fc["upper"] = np.percentile(sim, 90, axis=0)
+        # --- shared sanity clamp: if band is excessively wide, fallback to Relative ---
+        if "lower" in fc.columns and "upper" in fc.columns:
+            yhat = fc["forecast"].to_numpy(dtype=float)
+            lo   = fc["lower"].to_numpy(dtype=float)
+            hi   = fc["upper"].to_numpy(dtype=float)
+
+            # typical half-width as a fraction of forecast level
+            denom = np.maximum(1e-9, np.abs(yhat))
+            frac_half_width = np.median((hi - yhat) / denom)
+
+            # if typical half-width > 200%, treat as pathological → fallback to Relative
+            if not np.isfinite(frac_half_width) or frac_half_width > 2.0:
+                errs = st.session_state.bt.get("errors", {})
+                name_map = {"Elastic": "ElasticNet", "HoltWinters": "HoltWintersSafe"}
+                key = name_map.get(chosen_name, chosen_name)
+                ape_percent = float(errs.get(key, np.nan))
+                lower, upper, q = interval_from_backtest_ape(yhat, ape_percent)
+                fc["lower"] = lower
+                fc["upper"] = upper
+                st.caption(
+                    "Intervals were excessively wide; auto-switched to **Relative (from backtest)** "
+                    f"(half-width ≈ {q*100:.0f}%)."
+                )
     except Exception as e:
         st.info(f"Could not compute intervals: {e}")
 
@@ -859,13 +1017,22 @@ with tab_bpr:
     st.session_state.final_fc = fc
     fig = plot_history_forecast(hist_df, fc, title=f"Chosen: {chosen_name}")
     st.pyplot(fig, use_container_width=True)
+
+    # ---- Executive Summary (robust week-over-week window) ----
+    try:
+        pct, base_med, fc_med = summarize_change(hist_df, fc, weeks=8, col="sales")
+        direction = "increase" if pct >= 0 else "decrease"
+        pct_txt = f"{abs(pct)*100:.0f}% {direction}"
+    except Exception:
+        pass
+
     # ===================== END FINAL FORECAST TOP BLOCK =====================
 
     if "bt" not in st.session_state:
         st.info("Run backtest first.")
     else:
         # --- READ persisted selections from the Models tab ---
-        metric = st.session_state.get("metric", "SMAPE")
+        metric = st.session_state.get("metric", "MAE")
         horizon = int(st.session_state.get("horizon", 12))
         folds = int(st.session_state.get("folds", 6))
         include_models = st.session_state.get("include_models", ["Naive","sNaive","OLS","Elastic","LightGBM","XGBoost","HoltWinters","Prophet"])
@@ -882,7 +1049,9 @@ with tab_bpr:
         last_feat_date = pd.to_datetime(feat["date"]).max()
 
         # Scenario: adjust future drivers
-        future_dates = pd.date_range(last_feat_date + pd.Timedelta(weeks=1), periods=int(horizon), freq="W")
+        _freq = st.session_state.get("freq", "W")
+        step = pd.Timedelta(days=1) if _freq == "D" else pd.Timedelta(weeks=1)
+        future_dates = pd.date_range(last_feat_date + step, periods=int(horizon), freq=_freq)
         future_df = pd.DataFrame({"date": future_dates})
         # naive driver fill (carry last known)
         for c in ["price", "is_promo"]:
@@ -1050,7 +1219,8 @@ with tab_bpr:
                             feature_cols=sc_fcols,
                             model_name="LightGBM",
                             steps=int(horizon),
-                            seasonality=52,
+                            seasonality=st.session_state.get("seasonality", 52),
+                            freq=st.session_state.get("freq","W"),
                         )
                     else:
                         from models import fit_lgbm, predict_lgbm
@@ -1165,7 +1335,9 @@ with tab_bpr:
                         make_features_fn=build_features,
                         feature_cols=sc_fcols,
                         model_name="LightGBM",
-                        steps=int(horizon), seasonality=52,
+                        steps=int(horizon),
+                        seasonality=st.session_state.get("seasonality", 52),
+                        freq=st.session_state.get("freq","W"),
                     )
                     revs.append(float(np.nansum(df_fc["forecast"])))
                 else:
@@ -1229,7 +1401,9 @@ with tab_bpr:
             from models import fit_lgbm, predict_lgbm, train_full_and_forecast
             # Build synthetic future rows by reusing your Scenario helper path
             # 1) extend future dates
-            future_dates = pd.date_range(_hist["date"].max() + pd.Timedelta(days=7), periods=_h, freq="W")
+            _freq = st.session_state.get("freq", "W")
+            step = pd.Timedelta(days=1) if _freq == "D" else pd.Timedelta(weeks=1)
+            future_dates = pd.date_range(last_feat_date + step, periods=int(horizon), freq=_freq)
             # 2) clone hist; set future driver values
             df_future = pd.DataFrame({"date": future_dates})
             if "price" in _hist.columns:
@@ -1251,7 +1425,7 @@ with tab_bpr:
                     make_features_fn=build_features,
                     feature_cols=sc_fcols,
                     model_name="LightGBM",
-                    steps=_h, seasonality=52,
+                    steps=_h, seasonality=st.session_state.get("seasonality", 52),
                 )
                 return float(np.nansum(df_fc["forecast"]))
             else:
@@ -1469,25 +1643,71 @@ with tab_bpr:
 
         # -------------------- Executive Summary Paragraph -----------------------------
         st.markdown("### 🧾 AI Executive Summary")
-        # Trend vs recent history
-        _recent_k = min(12, len(_hist))
-        recent_mean = float(_hist.tail(_recent_k)["sales"].mean()) if _recent_k>0 else np.nan
-        # Produce the chosen (best) recommendation in words
-        if _best is not None:
-            pm_delta = (_best["price_mult"]/_price_mult_base - 1.0) * 100.0
-            pp_delta = (_best["promo_prob"] - _promo_prob_base) * 100.0
-            driver = "a targeted price move" if abs(pm_delta) >= abs(pp_delta) else "calibrated promo intensity"
-            trend_pct = ( (base_rev - (recent_mean*_last_price*_h)) / max(recent_mean*_last_price*_h, 1e-9) ) * 100.0 if np.isfinite(recent_mean) else 0.0
-            summary = (
-                f"Sales are projected to change by {trend_pct:+.1f}% next quarter. "
-                f"The model recommends focusing on {driver}, adjusting price by {pm_delta:+.1f}% "
-                f"and promo probability by {pp_delta:+.1f}pp. "
-                f"This yields an estimated profit impact of { _best['dProf']:+,.0f} "
-                f"and revenue change of { _best['dRev']:+,.0f}. "
-                f"Forecast stability is rated {stab_score:.0f}/100 ({risk_level} risk level)."
-            )
-        else:
-            summary = "Forecast produced no dominant strategy within ±10%/±10pp; expect stable outcomes under current settings."
+
+        # === Robust, like-for-like windows ===
+        # Use the continuous weekly, reindexed training frame (same one used for features),
+        # not the possibly gappy raw _hist.
+        try:
+            _weeks = 8  # window size for summary
+            hist_for_summary = train_feat[["date", "sales"]].dropna(subset=["sales"]).copy()
+
+            # Baseline = median sales of the last N historical weeks
+            base_sales_win = hist_for_summary.tail(_weeks)["sales"]
+            base_med_sales = float(base_sales_win.median()) if len(base_sales_win) else 0.0
+
+            # Forecast = median of first N forecast weeks
+            fc_win = final_fc.head(_weeks)[["date", "forecast"]].dropna(subset=["forecast"])
+            fc_med_sales = float(fc_win["forecast"].median()) if len(fc_win) else 0.0
+
+            # Safe percent change (bounded); if baseline ~0, avoid % and use direction.
+            _eps = 1e-6
+            if base_med_sales < _eps:
+                trend_pct = 0.0
+                trend_text = ("increase" if fc_med_sales > 0 else
+                            "no material change" if fc_med_sales == 0 else
+                            "decrease")
+                pct_phrase = f"{trend_text} vs a near-zero baseline"
+            else:
+                trend_frac = (fc_med_sales - base_med_sales) / base_med_sales
+                # clamp to human-sane range to avoid outliers from messy inputs
+                trend_frac = max(-0.95, min(trend_frac, 5.0))
+                trend_pct = trend_frac * 100.0
+                pct_phrase = f"{trend_pct:+.1f}% vs the last {_weeks} weeks"
+
+            # === Recommendation wording stays, but make deltas clear/safe ===
+            if _best is not None:
+                # price multiplier delta in %
+                pm_delta = ((_best.get("price_mult", _price_mult_base) / max(_price_mult_base, _eps)) - 1.0) * 100.0
+                # promo probability delta in *percentage points*
+                pp_base = float(_promo_prob_base)
+                pp_new  = float(_best.get("promo_prob", _promo_prob_base))
+                pp_delta_pp = (pp_new - pp_base) * 100.0
+
+                driver = "a targeted price move" if abs(pm_delta) >= abs(pp_delta_pp) else "calibrated promo intensity"
+
+                # Profit/Revenue changes already computed upstream in _best (keep as-is)
+                d_prof = float(_best.get("dProf", 0.0))
+                d_rev  = float(_best.get("dRev", 0.0))
+
+                summary = (
+                    f"Sales outlook: {pct_phrase} "
+                    f"(baseline median {base_med_sales:.1f} → forecast median {fc_med_sales:.1f}). "
+                    f"The model recommends focusing on {driver}, adjusting price by {pm_delta:+.1f}% "
+                    f"and promo probability by {pp_delta_pp:+.1f}pp. "
+                    f"Estimated impact: profit {d_prof:+,.0f}, revenue {d_rev:+,.0f}. "
+                    f"Forecast stability is {stab_score:.0f}/100 ({risk_level} risk)."
+                )
+            else:
+                summary = (
+                    f"Sales outlook: {pct_phrase} "
+                    f"(baseline median {base_med_sales:.1f} → forecast median {fc_med_sales:.1f}). "
+                    "No dominant strategy within ±10% price / ±10pp promo; expect broadly stable outcomes."
+                )
+
+        except Exception:
+            # Safe fallback: don’t crash the UI—keep your prior wording but avoid crazy %.
+            summary = "Forecast generated. Results stable; no dominant strategy detected this run."
+
         st.write(summary)
 
         
@@ -1532,17 +1752,19 @@ with tab_bpr:
         # Seasonality strength via ACF at lag 52
         if len(sales) >= 104:
             y = pd.Series(sales - np.nanmean(sales)).fillna(0.0).values
-            lag = 52
+            freq = st.session_state.get("freq","W")
+            lag = 7 if freq == "D" else 52
             if len(y) > lag + 1 and np.std(y[:-lag]) > 0 and np.std(y[lag:]) > 0:
                 season_acf = float(np.corrcoef(y[:-lag], y[lag:])[0,1])
-                st.write(f"**Seasonality (lag-52 ACF):** {season_acf:.2f}")
+                st.write(f"**Seasonality (lag-{lag} ACF):** {season_acf:.2f}")
 
         # Trend slope (units per week)
         if len(sales) > 5:
             t = np.arange(len(sales))
             slope, *_ = np.linalg.lstsq(np.column_stack([np.ones_like(t), t]), sales, rcond=None)
             trend_slope = float(slope[1])
-            st.write(f"**Trend Slope:** {trend_slope:+.2f} per week")
+            unit = "day" if freq == "D" else "week"
+            st.write(f"**Trend Slope:** {trend_slope:+.2f} per {unit}")
 
         # Improvement vs Naive (from backtest)
         errs_local = st.session_state.bt["errors"]

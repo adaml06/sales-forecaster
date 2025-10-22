@@ -2,9 +2,75 @@
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
-
-import numpy as np
+import warnings
+from sklearn.exceptions import ConvergenceWarning
 import pandas as pd
+import numpy as np
+
+def seasonality_from_freq(freq: str | None) -> int:
+    if freq == "D":
+        return 7
+    return 52  # default weekly
+
+def _clean_xy(X, y=None, fill=0.0):
+    """Return (X_clean, y_clean) with NaN/±inf handled and columns numeric.
+       If y is None, just cleans X."""
+    # ensure DataFrame for consistent ops
+    if not hasattr(X, "columns"):
+        # convert numpy array to DataFrame with generic columns
+        X = pd.DataFrame(X)
+    X = X.replace([np.inf, -np.inf], np.nan).ffill().fillna(fill)
+    # some models care about dtypes; force numeric
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(fill)
+    if y is None:
+        return X
+    y = (pd.Series(y)
+     .replace([np.inf, -np.inf], np.nan)
+     .ffill()
+     .bfill()
+     .fillna(0.0)
+     .astype(float))
+    return X, y
+
+def interval_from_backtest_ape(yhat: np.ndarray, ape_percent: float | None, floor: float = 0.05, cap: float = 1.50):
+    """
+    Build relative (percentage) bands around yhat using a single backtest error number.
+    - yhat: 1D array of point forecasts
+    - ape_percent: e.g., 18.3 for 18.3% (MAPE/SMAPE). If None/NaN, defaults to 35%.
+    - floor/cap clamp the relative half-width (e.g., 5% .. 150%)
+    Returns (lower, upper, q) where q is the half-width used as a fraction (0..1.5)
+    """
+    yhat = np.asarray(yhat, dtype=float)
+    if ape_percent is None or not np.isfinite(ape_percent):
+        q = 0.35
+    else:
+        q = float(ape_percent) / 100.0
+    q = max(float(floor), min(float(cap), q))
+    lower = np.maximum(0.0, yhat * (1.0 - q))
+    upper = yhat * (1.0 + q)
+    return lower, upper, q
+
+def summarize_change(hist_df: pd.DataFrame, fc_df: pd.DataFrame, weeks: int = 8, col: str = "sales"):
+    """
+    Compare the median of the last N historical weeks vs the first N forecast weeks.
+    Returns (pct_change, base_median, fc_median) with pct clamped to [-95%, +500%].
+    """
+    if weeks <= 0:
+        weeks = 8
+    h = hist_df[["date", col]].dropna(subset=[col]).tail(int(weeks))
+    f = fc_df[["date", "forecast"]].rename(columns={"forecast": col}).dropna(subset=[col]).head(int(weeks))
+    if len(h) == 0 or len(f) == 0:
+        return 0.0, 0.0, 0.0
+    base = float(h[col].median())
+    nxt  = float(f[col].median())
+    eps  = 1e-6
+    if base < eps:
+        # baseline ~0 → report +1/0/-1 as absolute direction (avoid inf%)
+        return (1.0 if nxt > 0 else 0.0) - (1.0 if base > 0 else 0.0), base, nxt
+    pct = (nxt - base) / base
+    pct = max(-0.95, min(pct, 5.0))
+    return pct, base, nxt
 
 # scikit-learn: models + metrics
 from sklearn.linear_model import LinearRegression, ElasticNetCV
@@ -166,23 +232,43 @@ def predict_ols(model, X: pd.DataFrame) -> np.ndarray:
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import ElasticNetCV
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression, ElasticNetCV
+
+def fit_ols(Xtr: pd.DataFrame, ytr: pd.Series):
+    pipe = Pipeline(steps=[
+        ("impute", SimpleImputer(strategy="constant", fill_value=0.0)),
+        ("ols", LinearRegression())
+    ])
+    pipe.fit(Xtr, ytr)
+    return pipe
+
+def predict_ols(model, X: pd.DataFrame) -> np.ndarray:
+    return model.predict(X).astype(float)
 
 def fit_enet(Xtr: pd.DataFrame, ytr: pd.Series):
+    # Slightly smaller grid so it does fewer fits (reduces warnings/time)
+    alpha_grid = np.logspace(-4, 2, num=40)
+
     pipe = Pipeline(steps=[
+        ("impute", SimpleImputer(strategy="constant", fill_value=0.0)),
         ("scaler", StandardScaler(with_mean=True, with_std=True)),
         ("enet", ElasticNetCV(
             l1_ratio=[0.1, 0.5, 0.9],
-            # Lighter inner-CV for small cloud CPUs; also uses new 'alphas' int form
             cv=3,
-            alphas=100,
-            max_iter=3000,
-            tol=1e-3,
+            alphas=alpha_grid,
+            max_iter=20000,   # up from 3000
+            tol=1e-2,         # a bit looser tolerance to converge faster
             random_state=0,
             n_jobs=1
         ))
     ])
-    pipe.fit(Xtr, ytr)
+
+    # Suppress only ElasticNet convergence warnings inside this fit
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+        pipe.fit(Xtr, ytr)
+
     return pipe
 
 def predict_enet(model, X: pd.DataFrame) -> np.ndarray:
@@ -309,12 +395,21 @@ def fit_prophet(X_or_df: pd.DataFrame, y: Optional[pd.Series] = None):
         m.add_regressor(r)
     m.fit(df)
 
+    # infer cadence from ds spacing
+    ds_sorted = pd.to_datetime(df["ds"]).sort_values().to_numpy()
+    freq = "W"
+    if len(ds_sorted) >= 3:
+        diffs = np.diff(ds_sorted).astype("timedelta64[D]").astype(int)
+        dailyish = ((diffs == 1) | (diffs == 2)).sum()
+        weekly   = (diffs == 7).sum()
+        freq = "D" if dailyish >= weekly else "W"
+
     bundle = {
         "model": m,
         "regressors": regressors,
         "last_vals": {r: float(df[r].iloc[-1]) for r in regressors},
         "last_date": pd.to_datetime(df["ds"]).max(),
-        "freq": "W",
+        "freq": freq,
     }
     return bundle
 
@@ -351,15 +446,34 @@ def backtest_models(
     metric: str = "MAPE",
     seasonality: int = 52,
     allowed_models: Optional[List[str]] = None,
+    freq: str | None = None,  # accepted for interface parity; not used internally
 ) -> Tuple[Dict[str, float], pd.DataFrame, str]:
-    """
-    Rolling-origin backtest across multiple models. Skips seasonal models
-    when there isn’t enough data.
-    """
     assert metric in _METRICS, f"metric must be one of {list(_METRICS.keys())}"
     score_fn = _METRICS[metric]
 
-    n = len(feat)
+    # 1) Only historical rows (labels known)
+    feat_hist = feat.loc[feat["sales"].notna()].copy()
+
+    # 2) Drop feature columns that are all-NaN across history (useless & dangerous)
+    if feature_cols:
+        hist_X = feat_hist[feature_cols]
+        bad_cols = [c for c in hist_X.columns if hist_X[c].notna().sum() == 0]
+        if bad_cols:
+            feature_cols = [c for c in feature_cols if c not in bad_cols]
+
+    # 3) Prefill historical features once (handles stragglers; remove ±inf too)
+    if feature_cols:
+        feat_hist[feature_cols] = (
+            feat_hist[feature_cols]
+            .replace([np.inf, -np.inf], np.nan)
+            .ffill()
+            .fillna(0.0)
+        )
+
+    n = len(feat_hist)
+    if n <= horizon + 5:
+        raise ValueError("Not enough rows to backtest. Add more history or reduce folds/horizon.")
+
     step = max((n - horizon) // max(folds, 1), 1)
     usable_folds = []
     for i in range(folds):
@@ -378,37 +492,67 @@ def backtest_models(
         models_to_try.append("Prophet")
     if allowed_models:
         models_to_try = [m for m in models_to_try if m in set(allowed_models)]
-        
 
     fold_rows = []
     per_model_errs: Dict[str, List[float]] = {m: [] for m in models_to_try}
 
     for end in usable_folds:
-        train = feat.iloc[:end].copy()
-        val   = feat.iloc[end:end + horizon].copy()
-        ytr, yv = train["sales"], val["sales"]
-        Xtr, Xv = train[feature_cols], val[feature_cols]
+        # 4) Slice folds from the historical frame only
+        train = feat_hist.iloc[:end].copy()
+        val   = feat_hist.iloc[end:end + horizon].copy()
 
-        # Naive
+        # 5) Reindex to FINAL feature set each fold (drop extras, add missings)
+        if feature_cols:
+            Xtr = train.reindex(columns=feature_cols, fill_value=0.0)[feature_cols]
+            Xv  = val.reindex(columns=feature_cols,   fill_value=0.0)[feature_cols]
+        else:
+            Xtr = pd.DataFrame(index=train.index)
+            Xv  = pd.DataFrame(index=val.index)
+
+        ytr = train["sales"].astype(float)
+        yv  = val["sales"].astype(float)
+
+        # 6) Absolute safety: clean X and y (NaN/±inf → finite)
+        Xtr, ytr = _clean_xy(Xtr, ytr, fill=0.0)
+        Xv,  yv  = _clean_xy(Xv,  yv,  fill=0.0)
+
+        # 6b) Per-fold drop of any columns that STILL contain NaN after cleaning
+        if Xtr.shape[1] > 0:
+            bad_cols_fold = [c for c in Xtr.columns if Xtr[c].isna().any() or Xv[c].isna().any()]
+            if bad_cols_fold:
+                keep_cols = [c for c in Xtr.columns if c not in bad_cols_fold]
+                Xtr = Xtr[keep_cols]
+                Xv  = Xv[keep_cols]
+
+        # 6c) Final guard on labels for XGB (and others)
+        ytr = pd.Series(ytr).replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0).astype(float)
+        yv  = pd.Series(yv ).replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0).astype(float)
+
+        # --- Naive ---
         naive_m = fit_naive(ytr)
-        naive_pred = predict_naive(naive_m, horizon)
+        naive_pred = predict_naive(naive_m, len(yv))
         per_model_errs["Naive"].append(score_fn(yv, naive_pred))
         fold_rows.append({"fold_end": end, "model": "Naive", "metric": metric, "score": per_model_errs["Naive"][-1]})
 
-        # sNaive
+        # --- sNaive ---
         if "sNaive" in models_to_try:
             snaive_m = fit_snaive(ytr, seasonality)
             if snaive_m is not None:
-                snaive_pred = predict_snaive(snaive_m, horizon)
+                snaive_pred = predict_snaive(snaive_m, len(yv))
                 per_model_errs["sNaive"].append(score_fn(yv, snaive_pred))
                 fold_rows.append({"fold_end": end, "model": "sNaive", "metric": metric, "score": per_model_errs["sNaive"][-1]})
 
-        # OLS + ElasticNet + LGBM + XGB (need features)
-        if len(Xtr.columns) > 0:
-            ols_m = fit_ols(Xtr, ytr)
-            per_model_errs["OLS"].append(score_fn(yv, predict_ols(ols_m, Xv)))
-            fold_rows.append({"fold_end": end, "model": "OLS", "metric": metric, "score": per_model_errs["OLS"][-1]})
+        # --- OLS ---
+        if "OLS" in models_to_try and Xtr.shape[1] > 0:
+            try:
+                ols_m = fit_ols(Xtr, ytr)
+                per_model_errs["OLS"].append(score_fn(yv, predict_ols(ols_m, Xv)))
+                fold_rows.append({"fold_end": end, "model": "OLS", "metric": metric, "score": per_model_errs["OLS"][-1]})
+            except Exception:
+                pass
 
+        # --- ElasticNet ---
+        if "ElasticNet" in models_to_try and Xtr.shape[1] > 0:
             try:
                 enet_m = fit_enet(Xtr, ytr)
                 per_model_errs["ElasticNet"].append(score_fn(yv, predict_enet(enet_m, Xv)))
@@ -416,6 +560,8 @@ def backtest_models(
             except Exception:
                 pass
 
+        # --- LightGBM ---
+        if "LightGBM" in models_to_try and Xtr.shape[1] > 0:
             try:
                 lgb_m = fit_lgbm(Xtr, ytr)
                 per_model_errs["LightGBM"].append(score_fn(yv, predict_lgbm(lgb_m, Xv)))
@@ -423,32 +569,33 @@ def backtest_models(
             except Exception:
                 pass
 
-            if _HAS_XGB:
-                try:
-                    xgb_m = fit_xgb(Xtr, ytr)
-                    per_model_errs["XGBoost"].append(score_fn(yv, predict_xgb(xgb_m, Xv)))
-                    fold_rows.append({"fold_end": end, "model": "XGBoost", "metric": metric, "score": per_model_errs["XGBoost"][-1]})
-                except Exception:
-                    pass
+        # --- XGBoost ---
+        if "XGBoost" in models_to_try and Xtr.shape[1] > 0 and _HAS_XGB:
+            try:
+                xgb_m = fit_xgb(Xtr, ytr)
+                per_model_errs["XGBoost"].append(score_fn(yv, predict_xgb(xgb_m, Xv)))
+                fold_rows.append({"fold_end": end, "model": "XGBoost", "metric": metric, "score": per_model_errs["XGBoost"][-1]})
+            except Exception:
+                pass
 
-        # Holt-Winters (auto-safe)
+        # --- Holt-Winters ---
         try:
             holt_m = fit_holt(ytr, seasonality)
-            holt_pred = predict_holt(holt_m, horizon)
+            holt_pred = predict_holt(holt_m, len(yv))
             per_model_errs["HoltWintersSafe"].append(score_fn(yv, holt_pred))
             fold_rows.append({"fold_end": end, "model": "HoltWintersSafe", "metric": metric, "score": per_model_errs["HoltWintersSafe"][-1]})
         except Exception:
             pass
 
-        # Prophet (uses date/sales + optional price/is_promo; ignores engineered lags)
+        # --- Prophet (unchanged) ---
         if "Prophet" in models_to_try:
             try:
                 df_tr = train[["date", "sales"]].copy()
                 for c in ["price", "is_promo"]:
                     if c in train.columns:
                         df_tr[c] = train[c]
-                p_m = fit_prophet(df_tr)  # fit from df with date/sales(+drivers)
-                preds = predict_prophet(p_m, steps=horizon)
+                p_m = fit_prophet(df_tr)
+                preds = predict_prophet(p_m, steps=len(yv))
                 per_model_errs["Prophet"].append(score_fn(yv, preds))
                 fold_rows.append({"fold_end": end, "model": "Prophet", "metric": metric, "score": per_model_errs["Prophet"][-1]})
             except Exception:
@@ -467,111 +614,154 @@ def backtest_models(
     fold_table = pd.DataFrame(fold_rows).sort_values(["fold_end", "model"]).reset_index(drop=True)
     return errors_by_model, fold_table, best_model_name
 
+    # Aggregate
+    errors_by_model: Dict[str, float] = {}
+    for m in models_to_try:
+        vals = per_model_errs.get(m, [])
+        if len(vals):
+            errors_by_model[m] = float(np.mean(vals))
+    if not errors_by_model:
+        raise ValueError("No models could be evaluated. Add more data or relax backtest settings.")
+
+    best_model_name = min(errors_by_model, key=errors_by_model.get)
+    fold_table = pd.DataFrame(fold_rows).sort_values(["fold_end", "model"]).reset_index(drop=True)
+    return errors_by_model, fold_table, best_model_name
+
 # -----------------------
 # Forecast on full history
 # -----------------------
+
 def train_full_and_forecast(
     df_hist: pd.DataFrame,
     make_features_fn,
-    feature_cols: List[str],
-    model_name: str,
-    steps: int,
-    seasonality: int = 52
-) -> pd.DataFrame:
-    """
-    Trains the chosen model on all data and produces a recursive forecast for `steps` weeks.
-    Expects df_hist with columns: date, sales, price, is_promo (extra drivers optional)
-    and a feature-making function identical to the one used in backtesting.
-    """
-    # Prophet path first (it doesn't use engineered lag features)
+    feature_cols: list[str],
+    model_name: str = "LightGBM",
+    steps: int = 12,
+    seasonality: int | None = None,
+    freq: str | None = None,
+):
+    # 0) Basic guards
+    if df_hist is None or len(df_hist) == 0:
+        return pd.DataFrame(columns=["date", "forecast"])
+
+    d = df_hist.copy().sort_values("date").reset_index(drop=True)
+
+    # 1) Infer cadence if not provided
+    if freq not in ("D", "W"):
+        ds = pd.to_datetime(d["date"]).sort_values().to_numpy()
+        if len(ds) >= 3:
+            diffs = np.diff(ds).astype("timedelta64[D]").astype(int)
+            dailyish = ((diffs == 1) | (diffs == 2)).sum()
+            weekly   = (diffs == 7).sum()
+            freq = "D" if dailyish >= weekly else "W"
+        else:
+            freq = "W"
+
+    step = pd.Timedelta(days=1 if freq == "D" else 7)
+    _seasonality = seasonality if seasonality is not None else (7 if freq == "D" else 52)
+
+    # 2) FUTURE DATES
+    last_date = pd.to_datetime(d["date"]).max()
+    future_dates = pd.date_range(last_date + step, periods=int(steps), freq=freq)
+
+    # 3) Prophet path (no engineered features needed)
     if model_name == "Prophet":
         if not _HAS_PROPHET:
-            raise ImportError("prophet is not installed. Install it with: pip install prophet")
+            return pd.DataFrame(columns=["date", "forecast"])
         df_tr = df_hist[["date", "sales"]].copy()
         for c in ["price", "is_promo"]:
             if c in df_hist.columns:
                 df_tr[c] = df_hist[c]
-        p_m = fit_prophet(df_tr)
-        preds = predict_prophet(p_m, steps=steps)
-        future_dates = pd.date_range(df_hist["date"].max() + pd.Timedelta(days=7), periods=steps, freq="W")
+        p_bundle = fit_prophet(df_tr)
+        # Pass cadence to predictor
+        p_bundle["freq"] = freq
+        preds = predict_prophet(p_bundle, steps=int(steps))
         return pd.DataFrame({"date": future_dates, "forecast": preds})
 
-    # All other models use engineered features
-    feat_all, fcols = make_features_fn(df_hist.copy())
-    X_all, y_all = feat_all[fcols], feat_all["sales"]
+    # 4) Feature engineering (history only) — we will build future features next
+    feat_hist, fcols_hist = make_features_fn(df_hist.copy())
+    # choose feature set: either caller’s or what we just built
+    fcols = list(feature_cols) if feature_cols else list(fcols_hist)
 
-    # Fit chosen model on all data
-    if model_name == "Naive":
-        core_model = fit_naive(y_all)
-    elif model_name == "sNaive":
-        core_model = fit_snaive(y_all, seasonality)
-        if core_model is None:
-            core_model = fit_naive(y_all)
-            model_name = "Naive"
-    elif model_name == "OLS":
-        core_model = fit_ols(X_all, y_all)
-    elif model_name == "ElasticNet":
-        try:
-            core_model = fit_enet(X_all, y_all)
-        except Exception:
-            core_model = fit_ols(X_all, y_all)
-            model_name = "OLS"
-    elif model_name == "LightGBM":
-        try:
-            core_model = fit_lgbm(X_all, y_all)
-        except Exception:
-            core_model = fit_ols(X_all, y_all)
-            model_name = "OLS"
-    elif model_name == "XGBoost":
-        try:
-            core_model = fit_xgb(X_all, y_all)
-        except Exception:
-            core_model = fit_ols(X_all, y_all)
-            model_name = "OLS"
-    elif model_name == "HoltWintersSafe":
-        core_model = fit_holt(y_all, seasonality)
+    # Split to X/y on known history
+    hist_mask = feat_hist["sales"].notna()
+    X_tr = feat_hist.loc[hist_mask, fcols] if fcols else pd.DataFrame(index=feat_hist.index)
+    y_tr = feat_hist.loc[hist_mask, "sales"].astype(float)
+
+    # Safety cleanup
+    if fcols:
+        X_tr, y_tr = _clean_xy(X_tr, y_tr, fill=0.0)
     else:
-        core_model = fit_ols(X_all, y_all)
-        model_name = "OLS"
+        # If no features, the ML models can’t run — fall back to Holt/Naive
+        model_name = "HoltWintersSafe"
 
-    # Recursive forecast (weekly)
-    df_temp = df_hist.copy()
-    preds = []
-    last_date = df_temp["date"].max()
-
-    for _ in range(steps):
-        next_date = last_date + pd.Timedelta(days=7)
-        new_row = {
-            "date": next_date,
-            "sales": np.nan,
-            "price": df_temp["price"].iloc[-1] if "price" in df_temp.columns else np.nan,
-            "is_promo": df_temp["is_promo"].iloc[-1] if "is_promo" in df_temp.columns else 0,
-        }
-        df_temp = pd.concat([df_temp, pd.DataFrame([new_row])], ignore_index=True)
-
-        feat_tmp, fcols_tmp = make_features_fn(df_temp.copy())
-        if len(feat_tmp) == 0:
-            break
-        rowX = feat_tmp.iloc[[-1]][fcols_tmp]
-
-        if model_name == "Naive":
-            yhat = float(predict_naive(core_model, 1)[0])
-        elif model_name == "sNaive":
-            yhat = float(predict_snaive(core_model, 1)[0])
-        elif model_name in ("OLS", "ElasticNet", "LightGBM", "XGBoost"):
-            yhat = float(core_model.predict(rowX)[0])
-        elif model_name == "HoltWintersSafe":
-            known = df_temp["sales"].dropna()
-            holt_model = fit_holt(known, seasonality)
-            yhat = float(predict_holt(holt_model, 1)[0])
+    # 5) Fit chosen model
+    core_model = None
+    if model_name == "Naive":
+        core_model = fit_naive(y_tr)
+    elif model_name == "sNaive":
+        core_model = fit_snaive(y_tr, _seasonality) or fit_naive(y_tr)
+        if core_model and "last_season" not in core_model:
+            model_name = "Naive"  # fell back
+    elif model_name == "HoltWintersSafe":
+        core_model = fit_holt(y_tr, _seasonality)
+    elif model_name in ("OLS", "ElasticNet", "LightGBM", "XGBoost"):
+        # must have features
+        if len(fcols) == 0:
+            core_model = fit_holt(y_tr, _seasonality)
+            model_name = "HoltWintersSafe"
         else:
-            yhat = float(core_model.predict(rowX)[0])  # fallback
+            if model_name == "OLS":
+                core_model = fit_ols(X_tr, y_tr)
+            elif model_name == "ElasticNet":
+                core_model = fit_enet(X_tr, y_tr)
+            elif model_name == "LightGBM":
+                core_model = fit_lgbm(X_tr, y_tr)
+            elif model_name == "XGBoost":
+                core_model = fit_xgb(X_tr, y_tr)
+    else:
+        # Unknown -> safe fallback
+        model_name = "HoltWintersSafe"
+        core_model = fit_holt(y_tr, _seasonality)
 
-        df_temp.loc[df_temp["date"] == next_date, "sales"] = yhat
-        preds.append({"date": next_date, "forecast": yhat})
-        last_date = next_date
+    # 6) Predict
+    # (a) Statistical models: direct multi-step forecast
+    if model_name in ("Naive", "sNaive", "HoltWintersSafe"):
+        if model_name == "Naive":
+            yhat = predict_naive(core_model, int(steps))
+        elif model_name == "sNaive":
+            yhat = predict_snaive(core_model, int(steps))
+        else:
+            yhat = predict_holt(core_model, int(steps))
+        return pd.DataFrame({"date": future_dates, "forecast": yhat})
 
-    return pd.DataFrame(preds)
+    # (b) ML models: build future feature frame in batch and predict
+    # carry last-known drivers forward so the feature builder can compute future rows
+    future_stub = pd.DataFrame({"date": future_dates})
+    if "price" in df_hist.columns:
+        future_stub["price"] = float(df_hist["price"].dropna().iloc[-1])
+    if "is_promo" in df_hist.columns:
+        future_stub["is_promo"] = int(df_hist["is_promo"].dropna().iloc[-1]) if df_hist["is_promo"].notna().any() else 0
+
+    hist_plus_future = pd.concat([df_hist, future_stub], ignore_index=True)
+    feat_all, fcols_all = make_features_fn(hist_plus_future)
+    # Ensure we use the same columns as at train time (drivers first, same order)
+    fcols_final = [c for c in fcols if c in feat_all.columns]
+    Xf = feat_all.loc[feat_all["date"].isin(future_dates), fcols_final]
+    Xf = _clean_xy(Xf, fill=0.0)
+
+    # If for some reason future features are empty, bail safely
+    if Xf is None or len(Xf) == 0:
+        return pd.DataFrame(columns=["date", "forecast"])
+
+    yhat = predict_lgbm(core_model, Xf) if model_name == "LightGBM" else (
+           predict_enet(core_model, Xf) if model_name == "ElasticNet" else (
+           predict_ols(core_model, Xf)  if model_name == "OLS"       else (
+           predict_xgb(core_model, Xf)  if model_name == "XGBoost"   else None)))
+    if yhat is None:
+        return pd.DataFrame(columns=["date", "forecast"])
+
+    return pd.DataFrame({"date": future_dates, "forecast": np.asarray(yhat, dtype=float)})
 
 
 # ===============================
@@ -579,19 +769,55 @@ def train_full_and_forecast(
 # (thin wrappers that call our unified APIs)
 # ===============================
 
-def forecast_naive(df_hist, make_features_fn, feature_cols, steps, seasonality=52):
+def forecast_naive(
+    df_hist,
+    make_features_fn,
+    feature_cols,
+    steps,
+    seasonality=None,
+    freq=None,
+):
+    """
+    Naive forecast helper. 'seasonality' isn't actually used by Naive itself,
+    but we accept it for a consistent interface with other forecasters.
+    """
+    # compute safe defaults at call time
+    _freq = freq or "W"
+    _seasonality = seasonality if seasonality is not None else (7 if _freq == "D" else 52)
     return train_full_and_forecast(
         df_hist, make_features_fn, feature_cols, model_name="Naive", steps=steps, seasonality=seasonality
     )
 
-def forecast_snaive(df_hist, make_features_fn, feature_cols, steps, seasonality=52):
+def forecast_snaive(
+    df_hist,
+    make_features_fn,
+    feature_cols,
+    steps,
+    seasonality=None,
+    freq=None,
+):
+    # compute safe defaults at call time
+    _freq = (freq or "W").upper()
+    _seasonality = seasonality if seasonality is not None else (7 if _freq == "D" else 52)
     return train_full_and_forecast(
-        df_hist, make_features_fn, feature_cols, model_name="sNaive", steps=steps, seasonality=seasonality
+        df_hist, make_features_fn, feature_cols,
+        model_name="sNaive", steps=steps, seasonality=_seasonality, freq=_freq,
     )
 
-def forecast_ols(df_hist, make_features_fn, feature_cols, steps, seasonality=52):
+def forecast_ols(
+    df_hist,
+    make_features_fn,
+    feature_cols,
+    steps,
+    seasonality=None,
+    freq=None,
+):
+    # compute safe defaults at call time
+    _freq = freq or "W"
+    _seasonality = seasonality if seasonality is not None else (7 if _freq == "D" else 52)
     return train_full_and_forecast(
-        df_hist, make_features_fn, feature_cols, model_name="OLS", steps=steps, seasonality=seasonality
+        df_hist, make_features_fn, feature_cols,
+        model_name="OLS", steps=steps, seasonality=_seasonality,  # <- use _seasonality
     )
 
 # --- v1.3: simple auto-tuners (fast, dependency-free) -----------------------
@@ -668,42 +894,102 @@ def tune_xgboost(feat: pd.DataFrame, feature_cols: list[str], metric: str = "SMA
     return best
 
 # Some apps call ElasticNet "elastic"
-def forecast_elastic(df_hist, make_features_fn, feature_cols, steps, seasonality=52):
+def forecast_elastic(
+    df_hist,
+    make_features_fn,
+    feature_cols,
+    steps,
+    seasonality=None,
+    freq=None,
+):
+    # compute safe defaults at call time
+    _freq = freq or "W"
+    _seasonality = seasonality if seasonality is not None else (7 if _freq == "D" else 52)
     return train_full_and_forecast(
-        df_hist, make_features_fn, feature_cols, model_name="ElasticNet", steps=steps, seasonality=seasonality
+        df_hist, make_features_fn, feature_cols,
+        model_name="ElasticNet", steps=steps, seasonality=_seasonality,  # <- use _seasonality
     )
 
-def forecast_lgbm(df_hist, make_features_fn, feature_cols, steps, seasonality=52):
+def forecast_lgbm(
+    df_hist,
+    make_features_fn,
+    feature_cols,
+    steps,
+    seasonality=None,
+    freq=None,
+):
+    # compute safe defaults at call time
+    _freq = freq or "W"
+    _seasonality = seasonality if seasonality is not None else (7 if _freq == "D" else 52)
     return train_full_and_forecast(
-        df_hist, make_features_fn, feature_cols, model_name="LightGBM", steps=steps, seasonality=seasonality
+        df_hist, make_features_fn, feature_cols,
+        model_name="LightGBM", steps=steps, seasonality=_seasonality,  # <- use _seasonality
     )
 
-def forecast_xgb(df_hist, make_features_fn, feature_cols, steps, seasonality=52):
+def forecast_xgb(
+    df_hist,
+    make_features_fn,
+    feature_cols,
+    steps,
+    seasonality=None,
+    freq=None,
+):
+    # compute safe defaults at call time
+    _freq = freq or "W"
+    _seasonality = seasonality if seasonality is not None else (7 if _freq == "D" else 52)
     return train_full_and_forecast(
-        df_hist, make_features_fn, feature_cols, model_name="XGBoost", steps=steps, seasonality=seasonality
+        df_hist, make_features_fn, feature_cols,
+        model_name="XGBoost", steps=steps, seasonality=_seasonality,  # <- use _seasonality
     )
 
-def forecast_holt(df_hist, make_features_fn, feature_cols, steps, seasonality=52):
-    # Holt-Winters safe wrapper
+def forecast_holt(
+    df_hist,
+    make_features_fn,
+    feature_cols,
+    steps,
+    seasonality=None,
+    freq=None,
+):
+    # compute safe defaults at call time
+    _freq = freq or "W"
+    _seasonality = seasonality if seasonality is not None else (7 if _freq == "D" else 52)
     return train_full_and_forecast(
-        df_hist, make_features_fn, feature_cols, model_name="HoltWintersSafe", steps=steps, seasonality=seasonality
+        df_hist, make_features_fn, feature_cols,
+        model_name="HoltWintersSafe", steps=steps, seasonality=_seasonality,  # <- use _seasonality
     )
 
-def forecast_prophet(df_hist, make_features_fn, feature_cols, steps, seasonality=52):
-    # Prophet ignores engineered features; we still pass them for signature compatibility
+def forecast_prophet(
+    df_hist,
+    make_features_fn,
+    feature_cols,
+    steps,
+    seasonality=None,
+    freq=None,
+):
+    # compute safe defaults at call time
+    _freq = freq or "W"
+    _seasonality = seasonality if seasonality is not None else (7 if _freq == "D" else 52)
     return train_full_and_forecast(
-        df_hist, make_features_fn, feature_cols, model_name="Prophet", steps=steps, seasonality=seasonality
+        df_hist, make_features_fn, feature_cols,
+        model_name="Prophet", steps=steps, seasonality=_seasonality,  # <- use _seasonality
     )
 
 # Some apps expect a helper to run a backtest directly
-def run_backtest(feat, feature_cols, folds=5, horizon=4, metric="MAPE", seasonality=52):
+def run_backtest(
+    feat,
+    feature_cols,
+    folds=5,
+    horizon=4,
+    metric="MAE",
+    seasonality=None,
+    freq=None,
+):
+    _freq = freq or "W"
+    _seasonality = seasonality if seasonality is not None else (7 if _freq == "D" else 52)
     return backtest_models(
-        feat=feat,
-        feature_cols=feature_cols,
-        folds=folds,
-        horizon=horizon,
-        metric=metric,
-        seasonality=seasonality,
+        feat, feature_cols,
+        folds=folds, horizon=horizon, metric=metric,
+        seasonality=_seasonality, freq=_freq
     )
 
 # --- v1.2: LightGBM Quantile helpers ---
